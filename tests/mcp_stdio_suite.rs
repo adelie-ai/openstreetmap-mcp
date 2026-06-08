@@ -110,7 +110,10 @@ impl Drop for McpStdioClient {
     }
 }
 
-/// Extract the `value` field from the first `type: json` content entry.
+/// Extract and parse the JSON payload from the first `type: text` content
+/// entry.  mcp-core serialises all tool results as `{"type":"text","text":"…"}`
+/// where the text is pretty-printed JSON; we parse the string back so callers
+/// can traverse the value as before.
 fn extract_value(tool_result: &Value) -> Value {
     let content = tool_result
         .get("content")
@@ -118,14 +121,15 @@ fn extract_value(tool_result: &Value) -> Value {
         .unwrap_or_else(|| panic!("expected result.content array, got: {tool_result}"));
 
     for entry in content {
-        if entry.get("type") == Some(&Value::String("json".to_string()))
-            && let Some(v) = entry.get("value")
+        if entry.get("type") == Some(&Value::String("text".to_string()))
+            && let Some(text) = entry.get("text").and_then(|v| v.as_str())
         {
-            return v.clone();
+            return serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("content text is not valid JSON: {e}\ntext: {text}"));
         }
     }
 
-    panic!("no json content entry in: {tool_result}");
+    panic!("no text content entry in: {tool_result}");
 }
 
 fn network_tests_enabled() -> bool {
@@ -231,13 +235,34 @@ fn test_tool_call_before_initialize_returns_error() {
     );
 }
 
-/// An unknown tool name must return a ToolNotFound error.
+/// An unknown tool name must surface as an `isError: true` tool result.
+///
+/// mcp-core maps `CallError::Tool` to spec-compliant `isError` content rather
+/// than a JSON-RPC protocol error, so `tool_call` succeeds but the result
+/// carries `isError: true`.
 #[test]
 fn test_unknown_tool_returns_error() {
     let mut client = McpStdioClient::start();
     client.initialize();
-    let result = client.tool_call("nonexistent_tool", json!({}));
-    expect_err_contains(result, "not found");
+    let result = client
+        .tool_call("nonexistent_tool", json!({}))
+        .expect("mcp-core surfaces unknown tool as isError content, not a protocol error");
+    assert_eq!(
+        result.get("isError"),
+        Some(&Value::Bool(true)),
+        "expected isError:true for unknown tool, got: {result}"
+    );
+    // The content text should mention the tool name so models understand what failed.
+    let content_text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        content_text.contains("unknown")
+            || content_text.contains("not found")
+            || content_text.contains("nonexistent"),
+        "expected error message to reference the unknown tool, got: {content_text}"
+    );
 }
 
 /// An unknown method must return a method-not-found error.

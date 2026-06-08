@@ -1,362 +1,50 @@
-// Binary crate for openstreetmap-mcp - uses library crate
+// Binary crate for openstreetmap-mcp.
+//
+// All JSON-RPC dispatch, transport framing, and CLI plumbing is owned by
+// mcp-core.  This file only wires the server-specific configuration flags into
+// the OsmService and hands it off.
 
-use axum::{
-    Router,
-    extract::{State, ws::WebSocketUpgrade},
-    response::Response,
-    routing::get,
-};
-use clap::{Parser, ValueEnum};
+use clap::Args;
+use mcp_core::{ServerConfig, run};
 use openstreetmap_mcp::config::{
     DEFAULT_NOMINATIM_URL, DEFAULT_OSRM_URL, DEFAULT_OVERPASS_URL, DEFAULT_USER_AGENT, OsmConfig,
 };
-use openstreetmap_mcp::error::{McpError, OsmError, OsmMcpError, Result};
-use openstreetmap_mcp::server::McpServer;
-use openstreetmap_mcp::transport::StdioTransportHandler;
-use serde_json::Value;
-use std::fmt;
-use std::sync::Arc;
-use tokio::net::TcpListener;
+use openstreetmap_mcp::service::OsmService;
 
-#[derive(Clone, Debug, ValueEnum)]
-enum TransportMode {
-    /// STDIN/STDOUT transport (recommended for VS Code and local usage)
-    Stdio,
-    /// WebSocket transport (recommended for hosted MCP services)
-    Websocket,
-}
+/// Server-specific flags flattened into mcp-core's `serve` subcommand.
+#[derive(Args)]
+struct OsmArgs {
+    /// Nominatim base URL (geocoding / reverse / lookup).
+    #[arg(long, env = "OSM_NOMINATIM_URL", default_value = DEFAULT_NOMINATIM_URL)]
+    nominatim_url: String,
 
-impl fmt::Display for TransportMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TransportMode::Stdio => write!(f, "stdio"),
-            TransportMode::Websocket => write!(f, "websocket"),
-        }
-    }
-}
+    /// Overpass API interpreter URL (feature queries).
+    #[arg(long, env = "OSM_OVERPASS_URL", default_value = DEFAULT_OVERPASS_URL)]
+    overpass_url: String,
 
-#[derive(Parser)]
-#[command(name = "openstreetmap-mcp")]
-#[command(about = "OpenStreetMap MCP Server")]
-#[command(
-    long_about = "openstreetmap-mcp exposes OpenStreetMap services (Nominatim geocoding, Overpass feature queries, and OSRM routing) as an MCP server for LLM orchestrators.\n\nUsage:\n  openstreetmap-mcp serve --mode stdio\n  openstreetmap-mcp serve --mode websocket --host 0.0.0.0 --port 8080"
-)]
-#[command(version)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+    /// OSRM routing base URL.
+    #[arg(long, env = "OSM_OSRM_URL", default_value = DEFAULT_OSRM_URL)]
+    osrm_url: String,
 
-#[derive(clap::Subcommand)]
-enum Commands {
-    /// Run the MCP server
-    Serve {
-        /// Transport mode
-        #[arg(short, long, default_value_t = TransportMode::Stdio)]
-        mode: TransportMode,
-        /// Port for WebSocket mode (ignored for stdio)
-        #[arg(short, long, default_value_t = 8080)]
-        port: u16,
-        /// Host for WebSocket mode (ignored for stdio)
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
-        /// Nominatim base URL (geocoding / reverse / lookup).
-        #[arg(long, env = "OSM_NOMINATIM_URL", default_value = DEFAULT_NOMINATIM_URL)]
-        nominatim_url: String,
-        /// Overpass API interpreter URL (feature queries).
-        #[arg(long, env = "OSM_OVERPASS_URL", default_value = DEFAULT_OVERPASS_URL)]
-        overpass_url: String,
-        /// OSRM routing base URL.
-        #[arg(long, env = "OSM_OSRM_URL", default_value = DEFAULT_OSRM_URL)]
-        osrm_url: String,
-        /// User-Agent sent to OSM services. The Nominatim usage policy requires
-        /// a descriptive, contactful value when using the public endpoint.
-        #[arg(long, env = "OSM_USER_AGENT", default_value = DEFAULT_USER_AGENT)]
-        user_agent: String,
-    },
+    /// User-Agent sent to OSM services. The Nominatim usage policy requires
+    /// a descriptive, contactful value when using the public endpoint.
+    #[arg(long, env = "OSM_USER_AGENT", default_value = DEFAULT_USER_AGENT)]
+    user_agent: String,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn main() -> mcp_core::Result<()> {
+    let config =
+        ServerConfig::new("openstreetmap-mcp", env!("CARGO_PKG_VERSION")).without_websocket();
 
-    match cli.command {
-        Commands::Serve {
-            mode,
-            port,
-            host,
-            nominatim_url,
-            overpass_url,
-            osrm_url,
-            user_agent,
-        } => {
-            let config = OsmConfig {
-                nominatim_url,
-                overpass_url,
-                osrm_url,
-                user_agent,
-            };
-            let server = McpServer::with_config(config);
-
-            match mode {
-                TransportMode::Stdio => run_stdio_server(server).await?,
-                TransportMode::Websocket => run_websocket_server(server, &host, port).await?,
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn run_stdio_server(server: McpServer) -> Result<()> {
-    let server = Arc::new(server);
-    let mut transport = StdioTransportHandler::new();
-
-    loop {
-        let message_str = match transport.read_message().await {
-            Ok(msg) => msg,
-            Err(e) => {
-                eprintln!("Error reading message: {}", e);
-                break;
-            }
+    run::<OsmArgs, OsmService, _, _>(config, |args| async move {
+        let osm_config = OsmConfig {
+            nominatim_url: args.nominatim_url,
+            overpass_url: args.overpass_url,
+            osrm_url: args.osrm_url,
+            user_agent: args.user_agent,
         };
-
-        if message_str.is_empty() {
-            continue;
-        }
-
-        let message: Value = match serde_json::from_str(&message_str) {
-            Ok(msg) => msg,
-            Err(e) => {
-                eprintln!("Error parsing JSON-RPC message: {}", e);
-                let error_response = jsonrpc_error_response(None, -32700, "Parse error", None);
-                if let Ok(resp_str) = serde_json::to_string(&error_response) {
-                    let _ = transport.write_message(&resp_str).await;
-                }
-                continue;
-            }
-        };
-
-        let response = handle_jsonrpc_message(Arc::clone(&server), message).await;
-
-        if let Some(resp) = response {
-            let resp_str = match serde_json::to_string(&resp) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error serializing response: {}", e);
-                    continue;
-                }
-            };
-            if let Err(e) = transport.write_message(&resp_str).await {
-                eprintln!("Error writing response: {}", e);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn run_websocket_server(server: McpServer, host: &str, port: u16) -> Result<()> {
-    let server = Arc::new(server);
-
-    let app = Router::new()
-        .route("/ws", get(websocket_handler))
-        .with_state(server);
-
-    let addr = format!("{}:{}", host, port);
-    let listener = TcpListener::bind(&addr).await?;
-    eprintln!("WebSocket server listening on {}", addr);
-
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn websocket_handler(ws: WebSocketUpgrade, State(server): State<Arc<McpServer>>) -> Response {
-    ws.on_upgrade(move |socket| handle_websocket_connection(socket, server))
-}
-
-async fn handle_websocket_connection(socket: axum::extract::ws::WebSocket, server: Arc<McpServer>) {
-    use axum::extract::ws::Message;
-    use futures_util::{SinkExt, StreamExt};
-
-    let (mut sender, mut receiver) = socket.split();
-
-    while let Some(msg) = receiver.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                let message: Value = match serde_json::from_str(&text) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        eprintln!("Error parsing JSON-RPC message: {}", e);
-                        let error_response =
-                            jsonrpc_error_response(None, -32700, "Parse error", None);
-                        if let Ok(resp_str) = serde_json::to_string(&error_response) {
-                            let _ = sender.send(Message::Text(resp_str.into())).await;
-                        }
-                        continue;
-                    }
-                };
-
-                let response = handle_jsonrpc_message(Arc::clone(&server), message).await;
-
-                if let Some(resp) = response
-                    && let Ok(resp_str) = serde_json::to_string(&resp)
-                    && let Err(e) = sender.send(Message::Text(resp_str.into())).await
-                {
-                    eprintln!("Error sending WebSocket response: {}", e);
-                    break;
-                }
-            }
-            Ok(Message::Close(_)) => {
-                break;
-            }
-            Err(e) => {
-                eprintln!("WebSocket error: {}", e);
-                break;
-            }
-            _ => {}
-        }
-    }
-}
-
-async fn handle_jsonrpc_message(server: Arc<McpServer>, message: Value) -> Option<Value> {
-    if let Some(jsonrpc_version) = message.get("jsonrpc").and_then(|v| v.as_str())
-        && jsonrpc_version != "2.0"
-    {
-        let id = message.get("id").cloned();
-        let error_msg = format!("Invalid JSON-RPC version: {}", jsonrpc_version);
-        return Some(jsonrpc_error_response(id, -32600, &error_msg, None));
-    }
-
-    let id = message.get("id").cloned();
-    let method = message.get("method").and_then(|m| m.as_str());
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
-
-    let is_notification = id.is_none();
-
-    let result = match method {
-        Some("initialize") => {
-            let protocol_version = params
-                .get("protocolVersion")
-                .and_then(|v| v.as_str())
-                .unwrap_or("2024-11-05");
-            let client_capabilities = params.get("capabilities").unwrap_or(&Value::Null);
-
-            server
-                .handle_initialize(protocol_version, client_capabilities)
-                .await
-        }
-        Some("initialized") | Some("notifications/initialized") => {
-            server.handle_initialized().await.map(|_| Value::Null)
-        }
-        Some("tools/list") => {
-            if !server.is_initialized().await {
-                return Some(jsonrpc_error_response(
-                    id,
-                    -32000,
-                    "Server not initialized. Call 'initialize' first.",
-                    None,
-                ));
-            }
-
-            Ok(serde_json::json!({ "tools": server.list_tools() }))
-        }
-        Some("tools/call") => {
-            if !server.is_initialized().await {
-                return Some(jsonrpc_error_response(
-                    id,
-                    -32000,
-                    "Server not initialized. Call 'initialize' first.",
-                    None,
-                ));
-            }
-
-            let tool_name = params.get("name").and_then(|n| n.as_str());
-            let arguments = params.get("arguments").unwrap_or(&Value::Null);
-
-            if let Some(name) = tool_name {
-                server.handle_tool_call(name, arguments).await
-            } else {
-                return Some(jsonrpc_error_response(
-                    id,
-                    -32602,
-                    "Invalid params: Missing tool name",
-                    None,
-                ));
-            }
-        }
-        Some("shutdown") => {
-            if !server.is_initialized().await {
-                return Some(jsonrpc_error_response(
-                    id,
-                    -32000,
-                    "Server not initialized. Call 'initialize' first.",
-                    None,
-                ));
-            }
-
-            server.handle_shutdown().await.map(|_| Value::Null)
-        }
-        Some(_) | None => {
-            return Some(jsonrpc_error_response(
-                id,
-                -32601,
-                &format!("Method not found: {:?}", method.unwrap_or("(missing)")),
-                None,
-            ));
-        }
-    };
-
-    match result {
-        Ok(result_value) => {
-            if is_notification {
-                None
-            } else {
-                Some(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": result_value,
-                }))
-            }
-        }
-        Err(e) => {
-            if is_notification {
-                None
-            } else {
-                let code = jsonrpc_error_code(&e);
-                Some(jsonrpc_error_response(id, code, &e.to_string(), None))
-            }
-        }
-    }
-}
-
-/// Map an `OsmMcpError` to the most appropriate JSON-RPC error code.
-///
-/// -32602 (Invalid params) is returned for caller-side parameter errors so
-/// that MCP clients can distinguish bad input from server-side failures.
-/// Everything else falls back to -32000 (Server error).
-fn jsonrpc_error_code(e: &OsmMcpError) -> i32 {
-    match e {
-        OsmMcpError::Osm(OsmError::InvalidParameters(_))
-        | OsmMcpError::Mcp(McpError::InvalidToolParameters(_)) => -32602,
-        _ => -32000,
-    }
-}
-
-fn jsonrpc_error_response(
-    id: Option<Value>,
-    code: i32,
-    message: &str,
-    data: Option<Value>,
-) -> Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message,
-            "data": data,
-        },
+        Ok(OsmService::with_config(osm_config))
     })
+    .await
 }
