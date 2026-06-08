@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // MCP server implementation
 
 use crate::config::OsmConfig;

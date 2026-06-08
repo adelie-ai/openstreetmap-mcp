@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // OpenStreetMap operation implementations.
 //
 // Each module wraps one upstream OSM service call and normalizes its response

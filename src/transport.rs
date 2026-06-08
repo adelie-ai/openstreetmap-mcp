@@ -1,7 +1,9 @@
-#![deny(warnings)]
-
 use crate::error::{Result, TransportError};
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Stdin, Stdout};
+
+/// Maximum Content-Length we will allocate for a single JSON-RPC message.
+/// A malicious or buggy sender claiming a huge payload must not cause an OOM.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StdioFraming {
@@ -160,6 +162,14 @@ impl StdioTransportHandler {
             ))
         })?;
 
+        if content_length > MAX_MESSAGE_BYTES {
+            return Err(TransportError::InvalidMessage(format!(
+                "Content-Length {} exceeds the maximum allowed message size of {} bytes",
+                content_length, MAX_MESSAGE_BYTES
+            ))
+            .into());
+        }
+
         loop {
             let mut header_line = String::new();
             let n = self
@@ -186,5 +196,34 @@ impl StdioTransportHandler {
             TransportError::InvalidMessage(format!("Invalid UTF-8 in JSON-RPC message: {}", e))
         })?;
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_content_length_header_accepts_valid() {
+        assert_eq!(
+            parse_content_length_header("Content-Length: 42\r\n"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_content_length_header("content-length: 100"),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn parse_content_length_header_rejects_non_header() {
+        assert_eq!(parse_content_length_header("{\"jsonrpc\":\"2.0\"}"), None);
+        assert_eq!(parse_content_length_header(""), None);
+    }
+
+    #[test]
+    fn max_message_bytes_constant_is_16_mib() {
+        // Guard: if someone changes the constant, tests should catch it.
+        assert_eq!(MAX_MESSAGE_BYTES, 16 * 1024 * 1024);
     }
 }

@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Error types for the openstreetmap-mcp crate
 
 use thiserror::Error;

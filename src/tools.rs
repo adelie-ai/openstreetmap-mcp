@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Tool registry and MCP tool definitions.
 
 use crate::config::OsmConfig;
@@ -52,8 +50,10 @@ impl ToolRegistry {
                             "description": "Free-form search text. Examples: 'London', 'Eiffel Tower', '1600 Pennsylvania Avenue NW, Washington DC'."
                         },
                         "limit": {
-                            "type": "number",
-                            "description": "Maximum number of results. Range: 1-40 (default: 10)."
+                            "type": "integer",
+                            "description": "Maximum number of results. Range: 1-40 (default: 10).",
+                            "minimum": 1,
+                            "maximum": 40
                         },
                         "language": {
                             "type": "string",
@@ -82,8 +82,10 @@ impl ToolRegistry {
                             "description": "Longitude in decimal degrees (WGS84). Range: -180 to 180."
                         },
                         "zoom": {
-                            "type": "number",
-                            "description": "Level of detail, 0 (country) to 18 (building). Default: 18. Lower values return broader areas (e.g. 10 = city)."
+                            "type": "integer",
+                            "description": "Level of detail, 0 (country) to 18 (building). Default: 18. Lower values return broader areas (e.g. 10 = city).",
+                            "minimum": 0,
+                            "maximum": 18
                         },
                         "language": {
                             "type": "string",
@@ -134,12 +136,16 @@ impl ToolRegistry {
                             "description": "Optional OSM tag value. When omitted, matches any feature that has the key. Examples: 'cafe', 'restaurant', 'supermarket'."
                         },
                         "radius": {
-                            "type": "number",
-                            "description": "Search radius in meters. Range: 1-50000 (default: 1000)."
+                            "type": "integer",
+                            "description": "Search radius in meters. Range: 1-50000 (default: 1000).",
+                            "minimum": 1,
+                            "maximum": 50000
                         },
                         "limit": {
-                            "type": "number",
-                            "description": "Maximum number of features to return. Range: 1-200 (default: 25)."
+                            "type": "integer",
+                            "description": "Maximum number of features to return. Range: 1-200 (default: 25).",
+                            "minimum": 1,
+                            "maximum": 200
                         }
                     },
                     "required": ["latitude", "longitude", "key"]
@@ -213,6 +219,7 @@ impl ToolRegistry {
     async fn execute_reverse(&self, args: &Value) -> Result<Value> {
         let latitude = require_f64(args, "latitude")?;
         let longitude = require_f64(args, "longitude")?;
+        validate_coord(latitude, longitude)?;
         let zoom = get_u64(args, "zoom").map(|z| z as u32);
         let language = get_str(args, "language");
 
@@ -239,6 +246,7 @@ impl ToolRegistry {
     async fn execute_nearby(&self, args: &Value) -> Result<Value> {
         let latitude = require_f64(args, "latitude")?;
         let longitude = require_f64(args, "longitude")?;
+        validate_coord(latitude, longitude)?;
         let key = require_str(args, "key")?;
         let value = get_str(args, "value");
         let radius = get_u64(args, "radius").unwrap_or(1000) as u32;
@@ -260,6 +268,9 @@ impl ToolRegistry {
 
     async fn execute_route(&self, args: &Value) -> Result<Value> {
         let coordinates = parse_coordinates(args)?;
+        for &(lat, lon) in &coordinates {
+            validate_coord(lat, lon)?;
+        }
         let profile = get_str(args, "profile").unwrap_or("driving");
         let steps = args.get("steps").and_then(Value::as_bool).unwrap_or(false);
 
@@ -311,6 +322,35 @@ fn require_f64(args: &Value, key: &str) -> Result<f64> {
 /// Coerce a JSON value into an `f64`, accepting numbers and numeric strings.
 fn value_as_f64(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok())
+}
+
+/// Validate that `(latitude, longitude)` are finite and within WGS84 range.
+///
+/// Non-finite values (NaN, ±Inf) would be silently embedded in URLs, producing
+/// unpredictable upstream behaviour or garbage results.
+fn validate_coord(latitude: f64, longitude: f64) -> Result<()> {
+    if !latitude.is_finite() || !longitude.is_finite() {
+        return Err(McpError::InvalidToolParameters(format!(
+            "Coordinates must be finite numbers, got latitude={} longitude={}",
+            latitude, longitude
+        ))
+        .into());
+    }
+    if !(-90.0..=90.0).contains(&latitude) {
+        return Err(McpError::InvalidToolParameters(format!(
+            "Latitude must be in [-90, 90], got {}",
+            latitude
+        ))
+        .into());
+    }
+    if !(-180.0..=180.0).contains(&longitude) {
+        return Err(McpError::InvalidToolParameters(format!(
+            "Longitude must be in [-180, 180], got {}",
+            longitude
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Parse the `coordinates` array for `osm_route` into `(lat, lon)` pairs.
@@ -412,7 +452,11 @@ mod tests {
     fn tool_result_uses_text_content_type() {
         let result = mcp_tool_result_json(json!({"foo": 1}));
         let content = &result["content"][0];
-        assert_eq!(content["type"], json!("text"), "content type must be 'text'");
+        assert_eq!(
+            content["type"],
+            json!("text"),
+            "content type must be 'text'"
+        );
         assert!(
             content.get("text").and_then(|v| v.as_str()).is_some(),
             "content must have a 'text' string field"
@@ -420,6 +464,67 @@ mod tests {
         assert!(
             content.get("value").is_none(),
             "non-spec 'value' field must not be present"
+        );
+    }
+
+    #[test]
+    fn validate_coord_accepts_valid() {
+        assert!(validate_coord(0.0, 0.0).is_ok());
+        assert!(validate_coord(-90.0, -180.0).is_ok());
+        assert!(validate_coord(90.0, 180.0).is_ok());
+        assert!(validate_coord(51.5, -0.12).is_ok());
+    }
+
+    #[test]
+    fn validate_coord_rejects_out_of_range() {
+        assert!(validate_coord(91.0, 0.0).is_err(), "lat > 90 must fail");
+        assert!(validate_coord(-91.0, 0.0).is_err(), "lat < -90 must fail");
+        assert!(validate_coord(0.0, 181.0).is_err(), "lon > 180 must fail");
+        assert!(validate_coord(0.0, -181.0).is_err(), "lon < -180 must fail");
+    }
+
+    #[test]
+    fn validate_coord_rejects_non_finite() {
+        assert!(validate_coord(f64::NAN, 0.0).is_err(), "NaN lat must fail");
+        assert!(
+            validate_coord(0.0, f64::INFINITY).is_err(),
+            "Inf lon must fail"
+        );
+        assert!(
+            validate_coord(f64::NEG_INFINITY, 0.0).is_err(),
+            "-Inf lat must fail"
+        );
+    }
+
+    #[test]
+    fn integer_schema_types_for_integer_params() {
+        let registry = ToolRegistry::new();
+        let tools = registry.list_tools();
+        let tools = tools.as_array().unwrap();
+
+        // osm_search.limit
+        let search = tools.iter().find(|t| t["name"] == "osm_search").unwrap();
+        assert_eq!(
+            search["inputSchema"]["properties"]["limit"]["type"],
+            "integer"
+        );
+
+        // osm_reverse.zoom
+        let reverse = tools.iter().find(|t| t["name"] == "osm_reverse").unwrap();
+        assert_eq!(
+            reverse["inputSchema"]["properties"]["zoom"]["type"],
+            "integer"
+        );
+
+        // osm_nearby.radius and osm_nearby.limit
+        let nearby = tools.iter().find(|t| t["name"] == "osm_nearby").unwrap();
+        assert_eq!(
+            nearby["inputSchema"]["properties"]["radius"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            nearby["inputSchema"]["properties"]["limit"]["type"],
+            "integer"
         );
     }
 

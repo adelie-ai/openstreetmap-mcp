@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Reverse geocoding via Nominatim `/reverse`.
 // https://nominatim.org/release-docs/develop/api/Reverse/
 

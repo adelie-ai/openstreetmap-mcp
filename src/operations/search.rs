@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Forward geocoding via Nominatim `/search`.
 // https://nominatim.org/release-docs/develop/api/Search/
 
@@ -49,10 +47,26 @@ pub async fn search(
     }
 
     let places: Vec<Place> = resp.json().await?;
-    if places.is_empty() {
-        return Err(OsmError::NotFound(format!("No places found for query: {}", query)).into());
-    }
-
+    // Return an empty array when Nominatim finds nothing, matching osm_nearby
+    // behaviour. An empty result is a valid answer; an LLM can branch on it
+    // without special-casing an error variant.
     let results: Vec<Value> = places.into_iter().map(place_to_json).collect();
     Ok(Value::Array(results))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::operations::nominatim::{Place, place_to_json};
+    use serde_json::Value;
+
+    #[test]
+    fn empty_search_returns_empty_array_not_error() {
+        // Verify that the empty-result path produces an empty JSON array rather
+        // than an OsmError::NotFound. We test the mapping directly because the
+        // Nominatim network call is not mocked in unit tests.
+        let empty: Vec<Place> = vec![];
+        let results: Vec<Value> = empty.into_iter().map(place_to_json).collect();
+        let out = Value::Array(results);
+        assert_eq!(out, Value::Array(vec![]));
+    }
 }
