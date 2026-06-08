@@ -1,26 +1,30 @@
-// Tool registry and MCP tool definitions.
+// McpService implementation: wires the OSM operations into the mcp-core
+// dispatch loop.
+
+use mcp_core::{CallError, McpService, ToolDef, ToolReply, async_trait};
+use serde_json::{Value, json};
 
 use crate::config::OsmConfig;
-use crate::error::{McpError, Result};
+use crate::error::{McpError, OsmError, OsmMcpError};
 use crate::operations::{lookup, nearby, reverse, route, search};
-use serde_json::Value;
 
-/// Tool registry that owns the shared HTTP client and OSM configuration and
-/// dispatches MCP tool calls to the matching operation.
-pub struct ToolRegistry {
+/// The MCP service implementation for OpenStreetMap.
+///
+/// Owns the shared `reqwest::Client` and the OSM endpoint configuration.
+/// `McpService::call_tool` dispatches to the appropriate operation module and
+/// maps domain errors to the correct `CallError` variant.
+pub struct OsmService {
     client: reqwest::Client,
     config: OsmConfig,
 }
 
-impl ToolRegistry {
-    /// Create a registry using the default OSM endpoints.
+impl OsmService {
+    /// Create a service using the default OSM endpoints.
     pub fn new() -> Self {
         Self::with_config(OsmConfig::default())
     }
 
-    /// Create a registry with a specific OSM configuration. The configured
-    /// `user_agent` is baked into the HTTP client, satisfying the Nominatim
-    /// usage policy's identification requirement.
+    /// Create a service with a specific OSM configuration.
     pub fn with_config(config: OsmConfig) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(config.user_agent.clone())
@@ -35,14 +39,22 @@ impl ToolRegistry {
             .expect("reqwest client builder only fails on TLS backend initialization");
         Self { client, config }
     }
+}
 
-    /// Get all tools in MCP format.
-    pub fn list_tools(&self) -> Value {
-        serde_json::json!([
-            {
-                "name": "osm_search",
-                "description": "Forward geocode: search OpenStreetMap (via Nominatim) for places matching a free-form query and return matching results with coordinates, OSM ids, category/type, a structured address, importance, and bounding box. Use for cities, addresses, and points of interest. Returns up to 'limit' results ordered by relevance.",
-                "inputSchema": {
+impl Default for OsmService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl McpService for OsmService {
+    fn tools(&self) -> Vec<ToolDef> {
+        vec![
+            ToolDef::new(
+                "osm_search",
+                "Forward geocode: search OpenStreetMap (via Nominatim) for places matching a free-form query and return matching results with coordinates, OSM ids, category/type, a structured address, importance, and bounding box. Use for cities, addresses, and points of interest. Returns up to 'limit' results ordered by relevance.",
+                json!({
                     "type": "object",
                     "properties": {
                         "query": {
@@ -65,12 +77,12 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["query"]
-                }
-            },
-            {
-                "name": "osm_reverse",
-                "description": "Reverse geocode: resolve a latitude/longitude to the nearest addressable place using Nominatim. Returns a single place with its display name, structured address, OSM id, and category/type.",
-                "inputSchema": {
+                }),
+            ),
+            ToolDef::new(
+                "osm_reverse",
+                "Reverse geocode: resolve a latitude/longitude to the nearest addressable place using Nominatim. Returns a single place with its display name, structured address, OSM id, and category/type.",
+                json!({
                     "type": "object",
                     "properties": {
                         "latitude": {
@@ -93,12 +105,12 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["latitude", "longitude"]
-                }
-            },
-            {
-                "name": "osm_lookup",
-                "description": "Look up specific OSM objects by id via Nominatim and return their details (address, coordinates, category/type). Use when you already have OSM ids, for example from a previous osm_search or osm_nearby result.",
-                "inputSchema": {
+                }),
+            ),
+            ToolDef::new(
+                "osm_lookup",
+                "Look up specific OSM objects by id via Nominatim and return their details (address, coordinates, category/type). Use when you already have OSM ids, for example from a previous osm_search or osm_nearby result.",
+                json!({
                     "type": "object",
                     "properties": {
                         "osm_ids": {
@@ -111,12 +123,12 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["osm_ids"]
-                }
-            },
-            {
-                "name": "osm_nearby",
-                "description": "Find OpenStreetMap features tagged with a given key (optionally key=value) within a radius of a coordinate, using the Overpass API. Returns features (nodes/ways/relations) sorted nearest-first with name, coordinates, distance in meters, and all tags. Returns an empty array when nothing matches. Example: find cafes near a point with key='amenity', value='cafe'.",
-                "inputSchema": {
+                }),
+            ),
+            ToolDef::new(
+                "osm_nearby",
+                "Find OpenStreetMap features tagged with a given key (optionally key=value) within a radius of a coordinate, using the Overpass API. Returns features (nodes/ways/relations) sorted nearest-first with name, coordinates, distance in meters, and all tags. Returns an empty array when nothing matches. Example: find cafes near a point with key='amenity', value='cafe'.",
+                json!({
                     "type": "object",
                     "properties": {
                         "latitude": {
@@ -149,12 +161,12 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["latitude", "longitude", "key"]
-                }
-            },
-            {
-                "name": "osm_route",
-                "description": "Compute a route between two or more coordinates using OSRM. Returns total distance (meters) and duration (seconds), the route geometry as GeoJSON, snapped waypoints, and per-leg details (with optional turn-by-turn steps). Note the public OSRM demo server primarily supports the 'driving' profile.",
-                "inputSchema": {
+                }),
+            ),
+            ToolDef::new(
+                "osm_route",
+                "Compute a route between two or more coordinates using OSRM. Returns total distance (meters) and duration (seconds), the route geometry as GeoJSON, snapped waypoints, and per-leg details (with optional turn-by-turn steps). Note the public OSRM demo server primarily supports the 'driving' profile.",
+                json!({
                     "type": "object",
                     "properties": {
                         "coordinates": {
@@ -181,24 +193,25 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["coordinates"]
-                }
-            }
-        ])
+                }),
+            ),
+        ]
     }
 
-    /// Execute a tool call by name with the given arguments.
-    pub async fn execute_tool(&self, tool_name: &str, arguments: &Value) -> Result<Value> {
-        match tool_name {
-            "osm_search" => self.execute_search(arguments).await,
-            "osm_reverse" => self.execute_reverse(arguments).await,
-            "osm_lookup" => self.execute_lookup(arguments).await,
-            "osm_nearby" => self.execute_nearby(arguments).await,
-            "osm_route" => self.execute_route(arguments).await,
-            _ => Err(McpError::ToolNotFound(tool_name.to_string()).into()),
+    async fn call_tool(&self, name: &str, args: &Value) -> Result<ToolReply, CallError> {
+        match name {
+            "osm_search" => self.call_search(args).await,
+            "osm_reverse" => self.call_reverse(args).await,
+            "osm_lookup" => self.call_lookup(args).await,
+            "osm_nearby" => self.call_nearby(args).await,
+            "osm_route" => self.call_route(args).await,
+            other => Err(CallError::tool(format!("unknown tool: {other}"))),
         }
     }
+}
 
-    async fn execute_search(&self, args: &Value) -> Result<Value> {
+impl OsmService {
+    async fn call_search(&self, args: &Value) -> Result<ToolReply, CallError> {
         let query = require_str(args, "query")?;
         let limit = get_u64(args, "limit").unwrap_or(10) as u32;
         let language = get_str(args, "language");
@@ -212,11 +225,13 @@ impl ToolRegistry {
             language,
             countrycodes,
         )
-        .await?;
-        Ok(mcp_tool_result_json(result))
+        .await
+        .map_err(osm_to_call_error)?;
+
+        Ok(ToolReply::json(&result)?)
     }
 
-    async fn execute_reverse(&self, args: &Value) -> Result<Value> {
+    async fn call_reverse(&self, args: &Value) -> Result<ToolReply, CallError> {
         let latitude = require_f64(args, "latitude")?;
         let longitude = require_f64(args, "longitude")?;
         validate_coord(latitude, longitude)?;
@@ -231,19 +246,24 @@ impl ToolRegistry {
             zoom,
             language,
         )
-        .await?;
-        Ok(mcp_tool_result_json(result))
+        .await
+        .map_err(osm_to_call_error)?;
+
+        Ok(ToolReply::json(&result)?)
     }
 
-    async fn execute_lookup(&self, args: &Value) -> Result<Value> {
+    async fn call_lookup(&self, args: &Value) -> Result<ToolReply, CallError> {
         let osm_ids = require_str(args, "osm_ids")?;
         let language = get_str(args, "language");
 
-        let result = lookup::lookup(&self.client, &self.config, osm_ids, language).await?;
-        Ok(mcp_tool_result_json(result))
+        let result = lookup::lookup(&self.client, &self.config, osm_ids, language)
+            .await
+            .map_err(osm_to_call_error)?;
+
+        Ok(ToolReply::json(&result)?)
     }
 
-    async fn execute_nearby(&self, args: &Value) -> Result<Value> {
+    async fn call_nearby(&self, args: &Value) -> Result<ToolReply, CallError> {
         let latitude = require_f64(args, "latitude")?;
         let longitude = require_f64(args, "longitude")?;
         validate_coord(latitude, longitude)?;
@@ -262,11 +282,13 @@ impl ToolRegistry {
             value,
             limit,
         )
-        .await?;
-        Ok(mcp_tool_result_json(result))
+        .await
+        .map_err(osm_to_call_error)?;
+
+        Ok(ToolReply::json(&result)?)
     }
 
-    async fn execute_route(&self, args: &Value) -> Result<Value> {
+    async fn call_route(&self, args: &Value) -> Result<ToolReply, CallError> {
         let coordinates = parse_coordinates(args)?;
         for &(lat, lon) in &coordinates {
             validate_coord(lat, lon)?;
@@ -274,25 +296,38 @@ impl ToolRegistry {
         let profile = get_str(args, "profile").unwrap_or("driving");
         let steps = args.get("steps").and_then(Value::as_bool).unwrap_or(false);
 
-        let result = route::route(&self.client, &self.config, &coordinates, profile, steps).await?;
-        Ok(mcp_tool_result_json(result))
+        let result = route::route(&self.client, &self.config, &coordinates, profile, steps)
+            .await
+            .map_err(osm_to_call_error)?;
+
+        Ok(ToolReply::json(&result)?)
     }
 }
 
-impl Default for ToolRegistry {
-    fn default() -> Self {
-        Self::new()
+/// Map an `OsmMcpError` to the appropriate `CallError` variant.
+///
+/// - Caller-side parameter errors (invalid params, invalid tool params) map to
+///   `CallError::InvalidParams` (JSON-RPC -32602).
+/// - Everything else (upstream failures, not found, etc.) maps to
+///   `CallError::Tool` so the model sees `isError: true` content and can react.
+fn osm_to_call_error(e: OsmMcpError) -> CallError {
+    match &e {
+        OsmMcpError::Osm(OsmError::InvalidParameters(_))
+        | OsmMcpError::Mcp(McpError::InvalidToolParameters(_)) => {
+            CallError::invalid_params(e.to_string())
+        }
+        _ => CallError::tool(e.to_string()),
     }
 }
+
+// ── Argument helpers ──────────────────────────────────────────────────────────
 
 /// Require a non-empty string argument.
-fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, CallError> {
     args.get(key)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            McpError::InvalidToolParameters(format!("Missing required parameter: {}", key)).into()
-        })
+        .ok_or_else(|| CallError::invalid_params(format!("Missing required parameter: {key}")))
 }
 
 /// Optional string argument (absent or non-string → `None`).
@@ -300,8 +335,7 @@ fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
-/// Optional unsigned-integer argument, accepting JSON numbers and numeric
-/// strings.
+/// Optional unsigned-integer argument, accepting JSON numbers and numeric strings.
 fn get_u64(args: &Value, key: &str) -> Option<u64> {
     let v = args.get(key)?;
     v.as_u64()
@@ -310,13 +344,12 @@ fn get_u64(args: &Value, key: &str) -> Option<u64> {
 }
 
 /// Require a float argument, accepting JSON numbers and numeric strings.
-fn require_f64(args: &Value, key: &str) -> Result<f64> {
-    let v = args.get(key).ok_or_else(|| {
-        McpError::InvalidToolParameters(format!("Missing required parameter: {}", key))
-    })?;
-    value_as_f64(v).ok_or_else(|| {
-        McpError::InvalidToolParameters(format!("Parameter '{}' must be a number", key)).into()
-    })
+fn require_f64(args: &Value, key: &str) -> Result<f64, CallError> {
+    let v = args
+        .get(key)
+        .ok_or_else(|| CallError::invalid_params(format!("Missing required parameter: {key}")))?;
+    value_as_f64(v)
+        .ok_or_else(|| CallError::invalid_params(format!("Parameter '{key}' must be a number")))
 }
 
 /// Coerce a JSON value into an `f64`, accepting numbers and numeric strings.
@@ -328,81 +361,50 @@ fn value_as_f64(v: &Value) -> Option<f64> {
 ///
 /// Non-finite values (NaN, ±Inf) would be silently embedded in URLs, producing
 /// unpredictable upstream behaviour or garbage results.
-fn validate_coord(latitude: f64, longitude: f64) -> Result<()> {
+fn validate_coord(latitude: f64, longitude: f64) -> Result<(), CallError> {
     if !latitude.is_finite() || !longitude.is_finite() {
-        return Err(McpError::InvalidToolParameters(format!(
-            "Coordinates must be finite numbers, got latitude={} longitude={}",
-            latitude, longitude
-        ))
-        .into());
+        return Err(CallError::invalid_params(format!(
+            "Coordinates must be finite numbers, got latitude={latitude} longitude={longitude}"
+        )));
     }
     if !(-90.0..=90.0).contains(&latitude) {
-        return Err(McpError::InvalidToolParameters(format!(
-            "Latitude must be in [-90, 90], got {}",
-            latitude
-        ))
-        .into());
+        return Err(CallError::invalid_params(format!(
+            "Latitude must be in [-90, 90], got {latitude}"
+        )));
     }
     if !(-180.0..=180.0).contains(&longitude) {
-        return Err(McpError::InvalidToolParameters(format!(
-            "Longitude must be in [-180, 180], got {}",
-            longitude
-        ))
-        .into());
+        return Err(CallError::invalid_params(format!(
+            "Longitude must be in [-180, 180], got {longitude}"
+        )));
     }
     Ok(())
 }
 
 /// Parse the `coordinates` array for `osm_route` into `(lat, lon)` pairs.
-/// Each element must be an object with numeric `latitude` and `longitude`.
-fn parse_coordinates(args: &Value) -> Result<Vec<(f64, f64)>> {
+fn parse_coordinates(args: &Value) -> Result<Vec<(f64, f64)>, CallError> {
     let arr = args
         .get("coordinates")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            McpError::InvalidToolParameters(
-                "Missing required parameter: coordinates (array)".to_string(),
-            )
+            CallError::invalid_params("Missing required parameter: coordinates (array)")
         })?;
 
     let mut coords = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
         let lat = item.get("latitude").and_then(value_as_f64).ok_or_else(|| {
-            McpError::InvalidToolParameters(format!(
-                "coordinates[{}] is missing a numeric 'latitude'",
-                i
-            ))
+            CallError::invalid_params(format!("coordinates[{i}] is missing a numeric 'latitude'"))
         })?;
         let lon = item
             .get("longitude")
             .and_then(value_as_f64)
             .ok_or_else(|| {
-                McpError::InvalidToolParameters(format!(
-                    "coordinates[{}] is missing a numeric 'longitude'",
-                    i
+                CallError::invalid_params(format!(
+                    "coordinates[{i}] is missing a numeric 'longitude'"
                 ))
             })?;
         coords.push((lat, lon));
     }
     Ok(coords)
-}
-
-/// Wrap a JSON value in the MCP tool-result content envelope.
-///
-/// The MCP spec defines `"text"` and `"image"` as the only valid content
-/// types for tool results. We serialize the value to a pretty-printed JSON
-/// string and emit it as `"type":"text"` so that all conformant MCP clients
-/// can consume it.
-fn mcp_tool_result_json(value: Value) -> Value {
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    serde_json::json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text,
-            }
-        ]
-    })
 }
 
 #[cfg(test)]
@@ -449,25 +451,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_uses_text_content_type() {
-        let result = mcp_tool_result_json(json!({"foo": 1}));
-        let content = &result["content"][0];
-        assert_eq!(
-            content["type"],
-            json!("text"),
-            "content type must be 'text'"
-        );
-        assert!(
-            content.get("text").and_then(|v| v.as_str()).is_some(),
-            "content must have a 'text' string field"
-        );
-        assert!(
-            content.get("value").is_none(),
-            "non-spec 'value' field must not be present"
-        );
-    }
-
-    #[test]
     fn validate_coord_accepts_valid() {
         assert!(validate_coord(0.0, 0.0).is_ok());
         assert!(validate_coord(-90.0, -180.0).is_ok());
@@ -497,47 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn integer_schema_types_for_integer_params() {
-        let registry = ToolRegistry::new();
-        let tools = registry.list_tools();
-        let tools = tools.as_array().unwrap();
-
-        // osm_search.limit
-        let search = tools.iter().find(|t| t["name"] == "osm_search").unwrap();
-        assert_eq!(
-            search["inputSchema"]["properties"]["limit"]["type"],
-            "integer"
-        );
-
-        // osm_reverse.zoom
-        let reverse = tools.iter().find(|t| t["name"] == "osm_reverse").unwrap();
-        assert_eq!(
-            reverse["inputSchema"]["properties"]["zoom"]["type"],
-            "integer"
-        );
-
-        // osm_nearby.radius and osm_nearby.limit
-        let nearby = tools.iter().find(|t| t["name"] == "osm_nearby").unwrap();
-        assert_eq!(
-            nearby["inputSchema"]["properties"]["radius"]["type"],
-            "integer"
-        );
-        assert_eq!(
-            nearby["inputSchema"]["properties"]["limit"]["type"],
-            "integer"
-        );
-    }
-
-    #[test]
-    fn list_tools_exposes_the_five_osm_tools() {
-        let registry = ToolRegistry::new();
-        let tools = registry.list_tools();
-        let names: Vec<&str> = tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t.get("name").and_then(Value::as_str))
-            .collect();
+    fn tools_list_has_five_tools() {
+        let svc = OsmService::new();
+        let tools = svc.tools();
+        assert_eq!(tools.len(), 5);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for expected in [
             "osm_search",
             "osm_reverse",
@@ -547,5 +494,29 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+    }
+
+    #[test]
+    fn integer_schema_types_for_integer_params() {
+        let svc = OsmService::new();
+        let tools = svc.tools();
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap()
+                .input_schema
+                .clone()
+        };
+
+        let search = find("osm_search");
+        assert_eq!(search["properties"]["limit"]["type"], "integer");
+
+        let reverse = find("osm_reverse");
+        assert_eq!(reverse["properties"]["zoom"]["type"], "integer");
+
+        let nearby = find("osm_nearby");
+        assert_eq!(nearby["properties"]["radius"]["type"], "integer");
+        assert_eq!(nearby["properties"]["limit"]["type"], "integer");
     }
 }
