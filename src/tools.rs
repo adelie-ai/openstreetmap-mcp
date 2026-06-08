@@ -26,6 +26,11 @@ impl ToolRegistry {
     pub fn with_config(config: OsmConfig) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(config.user_agent.clone())
+            // Bound every request: 10 s to establish TCP, 30 s for the full
+            // response. The Overpass [timeout:25] is server-side only and does
+            // not protect against a stalled TCP connection.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             // A `reqwest::Client` only fails to build on TLS backend init,
             // which is an environment problem we cannot recover from at runtime.
             .build()
@@ -343,12 +348,18 @@ fn parse_coordinates(args: &Value) -> Result<Vec<(f64, f64)>> {
 }
 
 /// Wrap a JSON value in the MCP tool-result content envelope.
+///
+/// The MCP spec defines `"text"` and `"image"` as the only valid content
+/// types for tool results. We serialize the value to a pretty-printed JSON
+/// string and emit it as `"type":"text"` so that all conformant MCP clients
+/// can consume it.
 fn mcp_tool_result_json(value: Value) -> Value {
+    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     serde_json::json!({
         "content": [
             {
-                "type": "json",
-                "value": value,
+                "type": "text",
+                "text": text,
             }
         ]
     })
@@ -395,6 +406,21 @@ mod tests {
 
         let missing = json!({ "coordinates": [{"latitude": 1.0}] });
         assert!(parse_coordinates(&missing).is_err());
+    }
+
+    #[test]
+    fn tool_result_uses_text_content_type() {
+        let result = mcp_tool_result_json(json!({"foo": 1}));
+        let content = &result["content"][0];
+        assert_eq!(content["type"], json!("text"), "content type must be 'text'");
+        assert!(
+            content.get("text").and_then(|v| v.as_str()).is_some(),
+            "content must have a 'text' string field"
+        );
+        assert!(
+            content.get("value").is_none(),
+            "non-spec 'value' field must not be present"
+        );
     }
 
     #[test]

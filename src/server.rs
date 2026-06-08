@@ -44,8 +44,8 @@ impl McpServer {
             return Err(McpError::InvalidProtocolVersion(protocol_version.to_string()).into());
         }
 
-        let tools = self.tool_registry.list_tools();
-
+        // Tools are discoverable via tools/list; the MCP spec does not define
+        // a top-level "tools" key in the initialize result.
         let capabilities = serde_json::json!({
             "protocolVersion": protocol_version,
             "serverInfo": {
@@ -57,7 +57,6 @@ impl McpServer {
                     "listChanged": false,
                 },
             },
-            "tools": tools,
         });
 
         Ok(capabilities)
@@ -96,5 +95,27 @@ impl McpServer {
 impl Default for McpServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_response_has_no_top_level_tools_key() {
+        let server = McpServer::new();
+        let result = server
+            .handle_initialize("2024-11-05", &serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert!(
+            result.get("tools").is_none(),
+            "initialize result must not contain a top-level 'tools' key (non-spec)"
+        );
+        assert!(
+            result.get("capabilities").is_some(),
+            "initialize result must contain 'capabilities'"
+        );
     }
 }
