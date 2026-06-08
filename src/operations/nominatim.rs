@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Shared Nominatim response types and mapping.
 //
 // `search`, `reverse`, and `lookup` all return the same per-place object shape

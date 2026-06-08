@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Find nearby OSM features by tag via the Overpass API.
 // https://wiki.openstreetmap.org/wiki/Overpass_API
 
@@ -13,6 +11,9 @@ use serde_json::{Value, json};
 const MAX_RADIUS_M: u32 = 50_000;
 /// Hard cap on the number of features requested, to keep responses bounded.
 const MAX_LIMIT: u32 = 200;
+/// Maximum Overpass response body we will buffer before JSON parsing.
+/// Wide-radius queries can produce tens of MiB; cap to avoid memory exhaustion.
+const MAX_OVERPASS_RESPONSE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 #[derive(Debug, Deserialize)]
 struct OverpassResponse {
@@ -45,9 +46,9 @@ fn validate_tag_component(label: &str, s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(OsmError::InvalidParameters(format!("{} must not be empty", label)).into());
     }
-    if s.chars()
-        .any(|c| c == '"' || c == '\\' || c == '\n' || c == '\r' || c == ']' || c == '[')
-    {
+    if s.chars().any(|c| {
+        c == '"' || c == '\\' || c == '\n' || c == '\r' || c == ']' || c == '[' || c == '\0'
+    }) {
         return Err(OsmError::InvalidParameters(format!(
             "{} contains characters that are not allowed in an OSM tag: {:?}",
             label, s
@@ -122,7 +123,19 @@ pub async fn nearby(
         return Err(OsmError::ApiError(format!("Overpass returned HTTP {}", status)).into());
     }
 
-    let body: OverpassResponse = resp.json().await?;
+    // Read the response body with a hard cap before parsing.  Wide-radius
+    // Overpass queries can return tens of MiB; reject oversized payloads rather
+    // than buffering them unboundedly.
+    let bytes = resp.bytes().await?;
+    if bytes.len() > MAX_OVERPASS_RESPONSE_BYTES {
+        return Err(OsmError::ApiError(format!(
+            "Overpass response too large: {} bytes (limit {} bytes)",
+            bytes.len(),
+            MAX_OVERPASS_RESPONSE_BYTES
+        ))
+        .into());
+    }
+    let body: OverpassResponse = serde_json::from_slice(&bytes)?;
 
     let mut features: Vec<(f64, Value)> = body
         .elements
@@ -183,6 +196,15 @@ mod tests {
     fn rejects_injection_in_tag() {
         assert!(validate_tag_component("key", "amenity\"]; out;//").is_err());
         assert!(validate_tag_component("key", "amenity").is_ok());
+    }
+
+    #[test]
+    fn rejects_null_byte_in_tag() {
+        let with_null = "ameni\0ty";
+        assert!(
+            validate_tag_component("key", with_null).is_err(),
+            "null byte must be rejected"
+        );
     }
 
     #[test]

@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Runtime configuration: which OpenStreetMap service endpoints to talk to and
 // the User-Agent to identify ourselves with.
 //

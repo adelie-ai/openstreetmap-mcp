@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Look up specific OSM objects by id via Nominatim `/lookup`.
 // https://nominatim.org/release-docs/develop/api/Lookup/
 

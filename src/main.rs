@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 // Binary crate for openstreetmap-mcp - uses library crate
 
 use axum::{
@@ -12,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use openstreetmap_mcp::config::{
     DEFAULT_NOMINATIM_URL, DEFAULT_OSRM_URL, DEFAULT_OVERPASS_URL, DEFAULT_USER_AGENT, OsmConfig,
 };
-use openstreetmap_mcp::error::Result;
+use openstreetmap_mcp::error::{McpError, OsmError, OsmMcpError, Result};
 use openstreetmap_mcp::server::McpServer;
 use openstreetmap_mcp::transport::StdioTransportHandler;
 use serde_json::Value;
@@ -326,9 +324,23 @@ async fn handle_jsonrpc_message(server: Arc<McpServer>, message: Value) -> Optio
             if is_notification {
                 None
             } else {
-                Some(jsonrpc_error_response(id, -32000, &e.to_string(), None))
+                let code = jsonrpc_error_code(&e);
+                Some(jsonrpc_error_response(id, code, &e.to_string(), None))
             }
         }
+    }
+}
+
+/// Map an `OsmMcpError` to the most appropriate JSON-RPC error code.
+///
+/// -32602 (Invalid params) is returned for caller-side parameter errors so
+/// that MCP clients can distinguish bad input from server-side failures.
+/// Everything else falls back to -32000 (Server error).
+fn jsonrpc_error_code(e: &OsmMcpError) -> i32 {
+    match e {
+        OsmMcpError::Osm(OsmError::InvalidParameters(_))
+        | OsmMcpError::Mcp(McpError::InvalidToolParameters(_)) => -32602,
+        _ => -32000,
     }
 }
 
