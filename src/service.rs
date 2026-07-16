@@ -519,4 +519,60 @@ mod tests {
         assert_eq!(nearby["properties"]["radius"]["type"], "integer");
         assert_eq!(nearby["properties"]["limit"]["type"], "integer");
     }
+
+    /// Natural-language phrases a user is likely to type when looking for
+    /// navigation, geography, or nearby-place help. On the FTS-only
+    /// tool-discovery fallback (empty/NULL embeddings), terse descriptions rank
+    /// poorly against these, so every discovery-facing OSM tool must surface at
+    /// least one. Refs adelie-ai/desktop-assistant#502.
+    const NATURAL_SEARCH_TERMS: [&str; 5] = [
+        "directions",
+        "travel time",
+        "distance",
+        "navigation",
+        "nearby",
+    ];
+
+    /// Fetch a tool's description (lowercased) by name, or panic if absent.
+    fn tool_description(name: &str) -> String {
+        OsmService::new()
+            .tools()
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("tool {name} not advertised"))
+            .description
+            .to_lowercase()
+    }
+
+    #[test]
+    fn osm_route_description_mentions_driving_directions() {
+        let desc = tool_description("osm_route");
+        assert!(
+            desc.contains("driving directions"),
+            "osm_route description should mention 'driving directions' for FTS discovery, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn osm_route_description_mentions_travel_time() {
+        let desc = tool_description("osm_route");
+        assert!(
+            desc.contains("travel time"),
+            "osm_route description should mention 'travel time' for FTS discovery, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn osm_tools_descriptions_contain_natural_search_terms() {
+        // Parameterized over the route, geocode (forward + reverse), and nearby
+        // tools, the ones a user reaches for with natural phrasing.
+        for tool in ["osm_route", "osm_search", "osm_reverse", "osm_nearby"] {
+            let desc = tool_description(tool);
+            assert!(
+                NATURAL_SEARCH_TERMS.iter().any(|term| desc.contains(term)),
+                "{tool} description should contain at least one natural search term \
+                 {NATURAL_SEARCH_TERMS:?}, got: {desc}"
+            );
+        }
+    }
 }
