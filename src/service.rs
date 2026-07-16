@@ -523,8 +523,9 @@ mod tests {
     /// Natural-language phrases a user is likely to type when looking for
     /// navigation, geography, or nearby-place help. On the FTS-only
     /// tool-discovery fallback (empty/NULL embeddings), terse descriptions rank
-    /// poorly against these, so every discovery-facing OSM tool must surface at
-    /// least one. Refs adelie-ai/desktop-assistant#502.
+    /// poorly against these, so every natural-language-discovery OSM tool
+    /// (route, forward/reverse geocode, nearby - not the id-based osm_lookup)
+    /// must surface at least one. Refs adelie-ai/desktop-assistant#502.
     const NATURAL_SEARCH_TERMS: [&str; 5] = [
         "directions",
         "travel time",
