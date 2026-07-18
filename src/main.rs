@@ -5,10 +5,11 @@
 // the OsmService and hands it off.
 
 use clap::Args;
-use mcp_core::{ServerConfig, run};
+use mcp_core::run;
 use openstreetmap_mcp::config::{
     DEFAULT_NOMINATIM_URL, DEFAULT_OSRM_URL, DEFAULT_OVERPASS_URL, DEFAULT_USER_AGENT, OsmConfig,
 };
+use openstreetmap_mcp::server_config;
 use openstreetmap_mcp::service::OsmService;
 
 /// Server-specific flags flattened into mcp-core's `serve` subcommand.
@@ -34,8 +35,7 @@ struct OsmArgs {
 
 #[tokio::main]
 async fn main() -> mcp_core::Result<()> {
-    let config =
-        ServerConfig::new("openstreetmap-mcp", env!("CARGO_PKG_VERSION")).without_websocket();
+    let config = server_config();
 
     run::<OsmArgs, OsmService, _, _>(config, |args| async move {
         let osm_config = OsmConfig {
