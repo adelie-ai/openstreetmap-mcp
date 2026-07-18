@@ -179,6 +179,30 @@ fn test_initialize_response_shape() {
     );
 }
 
+/// The `initialize` response must carry a non-empty `instructions` string. The
+/// daemon captures it as the server's searchable description for tool discovery,
+/// so its absence blinds server-grain routing.
+#[test]
+fn test_initialize_response_includes_instructions() {
+    let mut client = McpStdioClient::start();
+    let resp = client
+        .call(
+            "initialize",
+            json!({"protocolVersion":"2025-11-25","capabilities":{}}),
+        )
+        .expect("initialize");
+
+    let result = resp.get("result").expect("result field");
+    let instructions = result
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        !instructions.trim().is_empty(),
+        "initialize result must include a non-empty instructions string, got: {result}"
+    );
+}
+
 /// `tools/list` must return the expected set of tool names.
 #[test]
 fn test_tools_list_contains_expected_tools() {
