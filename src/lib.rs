@@ -7,6 +7,8 @@ pub mod error;
 pub mod operations;
 pub mod service;
 
+pub use service::OsmService;
+
 /// Server-level MCP `instructions` blurb, returned in the `initialize` response.
 ///
 /// Why: the daemon captures this string and uses it as the server's searchable
@@ -27,9 +29,25 @@ pub fn server_config() -> ServerConfig {
         .instructions(SERVER_INSTRUCTIONS)
 }
 
+/// Construct the OpenStreetMap service with built-in defaults (public Nominatim/Overpass/OSRM,
+/// default user-agent), for in-process (compiled-in) hosting.
+pub fn build_service() -> OsmService {
+    OsmService::new()
+}
+
 #[cfg(test)]
 mod server_config_tests {
     use super::*;
+
+    #[test]
+    fn build_service_exposes_tools() {
+        use mcp_core::McpService;
+        let svc = build_service();
+        assert!(
+            !svc.tools().is_empty(),
+            "osm build_service() must expose at least one tool"
+        );
+    }
 
     #[test]
     fn server_config_exposes_nonempty_instructions() {
