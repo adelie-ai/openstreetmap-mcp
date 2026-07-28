@@ -94,7 +94,25 @@ impl McpStdioClient {
         self.notify("initialized", json!({}));
     }
 
+    /// A tool call's outcome as the model sees it.
+    ///
+    /// Since SEP-1303 a tool-level failure — including bad arguments — comes
+    /// back as a *successful* JSON-RPC response carrying `isError: true`, not as
+    /// a protocol error, precisely so the model can read it and self-correct.
+    /// Both shapes surface here as `Err`, so a test asserts "the call failed and
+    /// said why", which is what the model actually acts on.
     fn tool_call(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
+        let result = self.tool_call_raw(name, arguments)?;
+        if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+            return Err(result.to_string());
+        }
+        Ok(result)
+    }
+
+    /// The `tools/call` result exactly as it came off the wire, `isError` and
+    /// all. For tests asserting on the result *shape*; prefer [`Self::tool_call`]
+    /// when the test only cares whether the call succeeded.
+    fn tool_call_raw(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
         let resp = self.call("tools/call", json!({"name":name,"arguments":arguments}))?;
         resp.get("result")
             .cloned()
@@ -269,7 +287,7 @@ fn test_unknown_tool_returns_error() {
     let mut client = McpStdioClient::start();
     client.initialize();
     let result = client
-        .tool_call("nonexistent_tool", json!({}))
+        .tool_call_raw("nonexistent_tool", json!({}))
         .expect("mcp-core surfaces unknown tool as isError content, not a protocol error");
     assert_eq!(
         result.get("isError"),
