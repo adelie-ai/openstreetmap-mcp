@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use httpmock::{Method, MockServer};
 use mcp_core::{McpService, ServerCore, Session};
+use openstreetmap_mcp::config::OsmConfig;
 use openstreetmap_mcp::service::OsmService;
 use serde_json::{Value, json};
 use tracing::Level;
@@ -142,8 +144,8 @@ pub const SENTINEL_OSM_IDS: &str = "N90019002";
 
 /// One entry in [`sentinel_tool_calls`]: a tool, a sentinel-laden argument
 /// set, the rendered sentinel substrings that call must make reachable at
-/// DEBUG, and the exact message of *this crate's own* per-request debug log
-/// for that call.
+/// DEBUG, the exact message of *this crate's own* per-request debug log for
+/// that call, and how to mock the upstream into a success and a decline.
 ///
 /// `debug_message` matters beyond "some event mentions the sentinel":
 /// mcp-core's own dispatch already logs every tool's raw arguments at DEBUG
@@ -153,11 +155,157 @@ pub const SENTINEL_OSM_IDS: &str = "N90019002";
 /// this crate's own outbound-request `debug!` were never added. Requiring
 /// the specific message this crate's own `log_*_request` functions use is
 /// what proves *this* server's own logging exists, not only mcp-core's.
+///
+/// `mount_success` and `mount_decline` matter for a different reason
+/// (mcp-core#40 lesson 9, found in review after this ticket was written):
+/// covering every tool is not covering every path. A content test that only
+/// ever drives a hard transport failure (a closed port, which never reaches
+/// a parsed response) never exercises the code that builds
+/// `OsmError::NotFound` -- and that error's own `Display` is the one place
+/// in this crate that quotes a caller's coordinate or id back
+/// (`"No address found for ({latitude}, {longitude})"`,
+/// `"No objects found for osm_ids: {osm_ids}"`). A leak planted there would
+/// pass a leak test that only ever drove the transport-failure branch. Every
+/// tool's decline mount reaches that branch (or the nearest thing to it --
+/// see `mount_nearby_decline` and `mount_route_decline` below for the two
+/// tools whose decline path does not construct an `OsmError` at all).
 pub struct SentinelCall {
     pub tool: &'static str,
     pub args: Value,
     pub sentinels: Vec<String>,
     pub debug_message: &'static str,
+    /// Mount a response on `server` that makes this call succeed.
+    pub mount_success: fn(&MockServer),
+    /// Mount a response on `server` that makes this call decline: a normal
+    /// "nothing found" business outcome, not a fault, so it must count for
+    /// nothing on `osm.upstream_failures` (rule 8.2) -- and, for `osm_search`
+    /// / `osm_reverse` / `osm_lookup`, the shape that builds an
+    /// `OsmError::NotFound` quoting this call's own sentinel content.
+    pub mount_decline: fn(&MockServer),
+}
+
+/// The `OsmConfig` that points every upstream endpoint at `server`.
+pub fn config_for(server: &MockServer) -> OsmConfig {
+    OsmConfig {
+        nominatim_url: server.base_url(),
+        overpass_url: format!("{}/interpreter", server.base_url()),
+        osrm_url: server.base_url(),
+        user_agent: "openstreetmap-mcp-test/0.0".to_string(),
+    }
+}
+
+fn mount_search_success(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::GET).path("/search");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(include_str!("../fixtures/nominatim/search_success.json"));
+    });
+}
+
+/// A zero-result search is `Ok(Value::Array(vec![]))`, not an
+/// `OsmError::NotFound` -- `osm_search` has no error path that constructs
+/// one at all (see `src/operations/search.rs`).
+fn mount_search_decline(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::GET).path("/search");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(include_str!("../fixtures/nominatim/search_empty.json"));
+    });
+}
+
+fn mount_reverse_success(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::GET).path("/reverse");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"place_id":1,"osm_type":"node","osm_id":1,"lat":"10.0","lon":"20.0","display_name":"Fictional Place"}"#,
+            );
+    });
+}
+
+/// Nominatim's real "nothing near this coordinate" shape (confirmed live,
+/// see `tests/fixtures/nominatim/NOTES.md`). This is the path that builds
+/// `OsmError::NotFound(format!("No address found for ({latitude},
+/// {longitude}): {msg}"))`, quoting this call's own sentinel coordinate.
+fn mount_reverse_decline(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::GET).path("/reverse");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"error":"Unable to geocode"}"#);
+    });
+}
+
+fn mount_lookup_success(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::GET).path("/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(include_str!("../fixtures/nominatim/search_success.json"));
+    });
+}
+
+/// An empty array is the path that builds `OsmError::NotFound(format!("No
+/// objects found for osm_ids: {osm_ids}"))`, quoting this call's own
+/// sentinel id back.
+fn mount_lookup_decline(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::GET).path("/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(include_str!("../fixtures/nominatim/search_empty.json"));
+    });
+}
+
+fn mount_nearby_success(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::POST).path("/interpreter");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"elements":[{"type":"node","id":1,"lat":10.0,"lon":20.0,"tags":{"name":"Fictional Cafe"}}]}"#);
+    });
+}
+
+/// Unlike search/reverse/lookup, an empty Overpass result is `Ok(Value::Array(vec![]))`
+/// for `osm_nearby` too -- it has no `OsmError::NotFound` path at all (see
+/// `src/operations/nearby.rs`). Mounted anyway so the empty-result code path
+/// itself is still exercised by the leak check, even without an error
+/// `Display` to worry about.
+fn mount_nearby_decline(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::POST).path("/interpreter");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"elements":[]}"#);
+    });
+}
+
+fn mount_route_success(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::GET).path_includes("/route/v1/");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"code":"Ok","routes":[{"distance":1.0,"duration":1.0,"geometry":null,"legs":[]}],"waypoints":[]}"#);
+    });
+}
+
+/// `osm_route`'s `OsmError::NotFound` quotes OSRM's own `code`/`message`,
+/// not the caller's coordinates directly (see `src/operations/route.rs`).
+/// This mock fabricates an upstream message that happens to contain the
+/// sentinel coordinate, so the leak check still proves the mechanism -- an
+/// embedded value reaching `OsmError::NotFound`'s `Display` -- for this tool
+/// too, the same way a real OSRM deployment might echo a waypoint back in a
+/// diagnostic message.
+fn mount_route_decline(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(Method::GET).path_includes("/route/v1/");
+        then.status(200).header("content-type", "application/json").body(format!(
+            r#"{{"code":"NoRoute","message":"no route found near {SENTINEL_LATITUDE},{SENTINEL_LONGITUDE}"}}"#
+        ));
+    });
 }
 
 /// Every tool this server advertises, paired with a sentinel-laden argument
@@ -171,6 +319,8 @@ pub fn sentinel_tool_calls() -> Vec<SentinelCall> {
             args: json!({"query": SENTINEL_QUERY}),
             sentinels: vec![SENTINEL_QUERY.to_string()],
             debug_message: "querying nominatim search",
+            mount_success: mount_search_success,
+            mount_decline: mount_search_decline,
         },
         SentinelCall {
             tool: "osm_reverse",
@@ -180,12 +330,16 @@ pub fn sentinel_tool_calls() -> Vec<SentinelCall> {
                 SENTINEL_LONGITUDE.to_string(),
             ],
             debug_message: "querying nominatim reverse",
+            mount_success: mount_reverse_success,
+            mount_decline: mount_reverse_decline,
         },
         SentinelCall {
             tool: "osm_lookup",
             args: json!({"osm_ids": SENTINEL_OSM_IDS}),
             sentinels: vec![SENTINEL_OSM_IDS.to_string()],
             debug_message: "querying nominatim lookup",
+            mount_success: mount_lookup_success,
+            mount_decline: mount_lookup_decline,
         },
         SentinelCall {
             tool: "osm_nearby",
@@ -197,6 +351,8 @@ pub fn sentinel_tool_calls() -> Vec<SentinelCall> {
             }),
             sentinels: vec![SENTINEL_KEY.to_string(), SENTINEL_VALUE.to_string()],
             debug_message: "querying overpass",
+            mount_success: mount_nearby_success,
+            mount_decline: mount_nearby_decline,
         },
         SentinelCall {
             tool: "osm_route",
@@ -211,6 +367,8 @@ pub fn sentinel_tool_calls() -> Vec<SentinelCall> {
                 SENTINEL_LONGITUDE.to_string(),
             ],
             debug_message: "querying osrm route",
+            mount_success: mount_route_success,
+            mount_decline: mount_route_decline,
         },
     ]
 }

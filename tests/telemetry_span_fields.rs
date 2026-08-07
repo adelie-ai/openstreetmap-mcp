@@ -16,63 +16,106 @@
 // 8): a tool added later without a matching entry in
 // `support::sentinel_tool_calls()` fails `support::assert_covers_every_tool`
 // rather than shipping with an unguarded content-leak path.
+//
+// Table-driven over three upstream scenarios per tool, not only a hard
+// transport failure (mcp-core#40 lesson 9, found in review after this
+// ticket was written): success, a business decline (mocked so that, where
+// the tool has one, it drives the `OsmError::NotFound` path -- the one place
+// this crate quotes a caller's coordinate or id back into an error
+// `Display`), and a hard transport failure (a closed local port, which
+// exercises `reqwest::Error`'s own URL-quoting `Display`). A leak test that
+// only ever drove the transport-failure branch would never run the code that
+// builds `OsmError::NotFound` at all.
 
 mod support;
 
+use httpmock::MockServer;
 use openstreetmap_mcp::service::OsmService;
 use tracing::Level;
 
-use support::{capture_dispatch, closed_port_config, sentinel_tool_calls, tool_call};
+use support::{
+    Recorded, capture_dispatch, closed_port_config, config_for, sentinel_tool_calls, tool_call,
+};
 
-fn dispatch_all_sentinel_calls() -> support::Recorded {
-    let calls = sentinel_tool_calls();
-    let mut messages = vec![serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
-    })];
-    for (i, call) in calls.iter().enumerate() {
-        messages.push(tool_call(2 + i as u64, call.tool, call.args.clone()));
-    }
-    let service = OsmService::with_config(closed_port_config());
-    capture_dispatch(service, &messages)
+fn init() -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
 }
 
-/// AC (mcp-core#40, D10): for every advertised tool, called with a
-/// sentinel-laden argument set, no span field anywhere carries any sentinel
-/// value, and no INFO-or-louder event carries one.
+/// Dispatch every tool once per scenario (success, decline, hard transport
+/// failure) and return every recording, tagged with the tool and scenario
+/// that produced it.
+fn dispatch_all_scenarios() -> Vec<(&'static str, &'static str, Recorded)> {
+    let calls = sentinel_tool_calls();
+    let mut all = Vec::with_capacity(calls.len() * 3);
+
+    for call in &calls {
+        let success_server = MockServer::start();
+        (call.mount_success)(&success_server);
+        let recorded = capture_dispatch(
+            OsmService::with_config(config_for(&success_server)),
+            &[init(), tool_call(2, call.tool, call.args.clone())],
+        );
+        all.push((call.tool, "success", recorded));
+
+        let decline_server = MockServer::start();
+        (call.mount_decline)(&decline_server);
+        let recorded = capture_dispatch(
+            OsmService::with_config(config_for(&decline_server)),
+            &[init(), tool_call(2, call.tool, call.args.clone())],
+        );
+        all.push((call.tool, "decline", recorded));
+
+        let recorded = capture_dispatch(
+            OsmService::with_config(closed_port_config()),
+            &[init(), tool_call(2, call.tool, call.args.clone())],
+        );
+        all.push((call.tool, "hard_error", recorded));
+    }
+
+    all
+}
+
+/// AC (mcp-core#40, D10): for every advertised tool, under every scenario
+/// (success, decline, hard transport failure), no span field anywhere
+/// carries any sentinel value, and no INFO-or-louder event carries one.
 #[test]
 fn no_tool_call_leaks_content_into_any_span_field_or_info_event() {
     support::assert_covers_every_tool();
     let calls = sentinel_tool_calls();
-    let recorded = dispatch_all_sentinel_calls();
+    let scenarios = dispatch_all_scenarios();
 
     let all_sentinels: Vec<&str> = calls
         .iter()
         .flat_map(|call| call.sentinels.iter().map(String::as_str))
         .collect();
 
-    for span in &recorded.spans {
-        for (key, value) in &span.fields {
-            for sentinel in &all_sentinels {
-                assert!(
-                    !value.contains(sentinel),
-                    "sentinel {sentinel:?} reached span {:?} field {key:?}: {value:?}",
-                    span.name
-                );
+    for (tool, scenario, recorded) in &scenarios {
+        for span in &recorded.spans {
+            for (key, value) in &span.fields {
+                for sentinel in &all_sentinels {
+                    assert!(
+                        !value.contains(sentinel),
+                        "{tool} ({scenario}): sentinel {sentinel:?} reached span {:?} field \
+                         {key:?}: {value:?}",
+                        span.name
+                    );
+                }
             }
         }
-    }
 
-    for event in &recorded.events {
-        if event.level > Level::INFO {
-            continue;
-        }
-        for (key, value) in &event.fields {
-            for sentinel in &all_sentinels {
-                assert!(
-                    !value.contains(sentinel),
-                    "sentinel {sentinel:?} reached a {} line, field {key:?}: {value:?}",
-                    event.level
-                );
+        for event in &recorded.events {
+            if event.level > Level::INFO {
+                continue;
+            }
+            for (key, value) in &event.fields {
+                for sentinel in &all_sentinels {
+                    assert!(
+                        !value.contains(sentinel),
+                        "{tool} ({scenario}): sentinel {sentinel:?} reached a {} line, field \
+                         {key:?}: {value:?}",
+                        event.level
+                    );
+                }
             }
         }
     }
@@ -88,13 +131,20 @@ fn no_tool_call_leaks_content_into_any_span_field_or_info_event() {
 /// the exact message each `log_*_request` helper uses proves this server's
 /// own logging exists, tool by tool, and a tool missing its own debug event
 /// fails by name rather than being averaged away across the whole table.
+/// Checked on the success scenario only -- the log fires before the
+/// (possibly failing) network call either way, so any one scenario proves it.
 #[test]
 fn each_tool_call_logs_its_own_outbound_request_at_debug() {
     support::assert_covers_every_tool();
     let calls = sentinel_tool_calls();
-    let recorded = dispatch_all_sentinel_calls();
+    let scenarios = dispatch_all_scenarios();
 
     for call in &calls {
+        let (_, _, recorded) = scenarios
+            .iter()
+            .find(|(tool, scenario, _)| *tool == call.tool && *scenario == "success")
+            .expect("dispatch_all_scenarios must record a success run for every tool");
+
         let matching: Vec<_> = recorded
             .events
             .iter()
@@ -137,7 +187,7 @@ fn each_tool_call_logs_its_own_outbound_request_at_debug() {
 fn each_tool_handler_opens_its_own_span() {
     support::assert_covers_every_tool();
     let calls = sentinel_tool_calls();
-    let recorded = dispatch_all_sentinel_calls();
+    let scenarios = dispatch_all_scenarios();
 
     let expected_spans = [
         "call_search",
@@ -152,14 +202,13 @@ fn each_tool_handler_opens_its_own_span() {
         "the expected-span list must stay in step with the tool table"
     );
     for expected in expected_spans {
+        let opened_somewhere = scenarios
+            .iter()
+            .any(|(_, _, recorded)| recorded.spans.iter().any(|span| span.name == expected));
         assert!(
-            recorded.spans.iter().any(|span| span.name == expected),
-            "expected a {expected:?} span; the spans were {:?}",
-            recorded
-                .spans
-                .iter()
-                .map(|span| span.name)
-                .collect::<Vec<_>>()
+            opened_somewhere,
+            "expected a {expected:?} span in at least one scenario; none of the recorded runs \
+             had one"
         );
     }
 }
