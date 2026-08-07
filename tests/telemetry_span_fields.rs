@@ -20,12 +20,13 @@
 // Table-driven over three upstream scenarios per tool, not only a hard
 // transport failure (mcp-core#40 lesson 9, found in review after this
 // ticket was written): success, a business decline (mocked so that, where
-// the tool has one, it drives the `OsmError::NotFound` path -- the one place
-// this crate quotes a caller's coordinate or id back into an error
-// `Display`), and a hard transport failure (a closed local port, which
-// exercises `reqwest::Error`'s own URL-quoting `Display`). A leak test that
-// only ever drove the transport-failure branch would never run the code that
-// builds `OsmError::NotFound` at all.
+// the tool has one, it drives the `OsmError::NotFound` path -- one of
+// several places this crate can quote a caller's coordinate or id back into
+// an error `Display`; see `tests/support/mod.rs`'s `SentinelCall` doc
+// comment for the full list), and a hard transport failure (a closed local
+// port, which exercises `reqwest::Error`'s own URL-quoting `Display`). A
+// leak test that only ever drove the transport-failure branch would never
+// run the code that builds `OsmError::NotFound` at all.
 
 mod support;
 

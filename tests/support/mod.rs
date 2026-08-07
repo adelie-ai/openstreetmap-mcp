@@ -161,14 +161,29 @@ pub const SENTINEL_OSM_IDS: &str = "N90019002";
 /// covering every tool is not covering every path. A content test that only
 /// ever drives a hard transport failure (a closed port, which never reaches
 /// a parsed response) never exercises the code that builds
-/// `OsmError::NotFound` -- and that error's own `Display` is the one place
-/// in this crate that quotes a caller's coordinate or id back
-/// (`"No address found for ({latitude}, {longitude})"`,
-/// `"No objects found for osm_ids: {osm_ids}"`). A leak planted there would
-/// pass a leak test that only ever drove the transport-failure branch. Every
-/// tool's decline mount reaches that branch (or the nearest thing to it --
-/// see `mount_nearby_decline` and `mount_route_decline` below for the two
-/// tools whose decline path does not construct an `OsmError` at all).
+/// `OsmError::NotFound`, whose `Display` quotes a caller's coordinate or id
+/// back (`"No address found for ({latitude}, {longitude})"`, `"No objects
+/// found for osm_ids: {osm_ids}"`). `NotFound` is not the *only* variant
+/// that can carry content into a `Display` -- `OsmError::InvalidParameters`
+/// does too, whenever local validation rejects a caller's tag or profile
+/// (`src/operations/nearby.rs`'s `validate_tag_component`,
+/// `src/operations/route.rs`'s profile check), and `OsmMcpError::Http`
+/// embeds `reqwest::Error`'s own message, which quotes the full request URL
+/// including query parameters. `OsmError::ApiError` carries no caller
+/// content at any current call site, but nothing in the type stops one from
+/// adding it later. What actually keeps all of them safe is structural, not
+/// per-variant: every one of these reaches only `osm_to_call_error`'s
+/// `CallError::Tool` / `CallError::InvalidParams`, and mcp-core logs both of
+/// those through `Safe::message(&msg)` at DEBUG, never INFO (confirmed by
+/// reading `mcp-core`'s `server.rs`). `mount_decline` exercises the
+/// `NotFound` branch specifically because it is the most direct way to
+/// reach content-carrying `Display` text without depending on the
+/// transport-failure branch the hard-error scenario already covers, or
+/// local validation this table's sentinel values are deliberately built to
+/// pass. Every tool's decline mount reaches that branch (or the nearest
+/// thing to it -- see `mount_nearby_decline` and `mount_route_decline`
+/// below for the two tools whose decline path does not construct an
+/// `OsmError` at all).
 pub struct SentinelCall {
     pub tool: &'static str,
     pub args: Value,

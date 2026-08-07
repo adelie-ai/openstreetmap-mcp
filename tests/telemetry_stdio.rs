@@ -17,8 +17,9 @@
 // documents in full (mcp-core#40 lessons 8 and 9): a tool or a code path
 // missing from this table ships with an unguarded content-leak path, and a
 // leak test that only ever drives a hard transport failure never runs the
-// code that builds `OsmError::NotFound`, the one place this crate quotes a
-// caller's coordinate or id back into an error `Display`.
+// code that builds `OsmError::NotFound`, one of several places this crate
+// can quote a caller's coordinate or id back into an error `Display`; see
+// `tests/support/mod.rs`'s `SentinelCall` doc comment for the full list.
 
 mod support;
 
@@ -166,9 +167,10 @@ fn stdout_carries_only_jsonrpc_at_trace_level() {
 ///
 /// Table-driven over scenarios, not only the hard transport failure
 /// (mcp-core#40 lesson 9): the decline scenario is what drives
-/// `OsmError::NotFound`, the one place this crate quotes a caller's
-/// coordinate or id back into an error `Display` -- a leak planted there
-/// would never be reached by a closed-port-only test.
+/// `OsmError::NotFound`, one of several places this crate can quote a
+/// caller's coordinate or id back into an error `Display` (see
+/// `tests/support/mod.rs`'s `SentinelCall` doc comment) -- a leak planted
+/// there would never be reached by a closed-port-only test.
 #[test]
 fn no_sentinel_reaches_an_info_line_for_any_tool_or_scenario() {
     support::assert_covers_every_tool();
