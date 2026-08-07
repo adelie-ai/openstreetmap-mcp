@@ -38,6 +38,7 @@ pub async fn search(
         params.push(("countrycodes", cc.to_string()));
     }
 
+    log_search_request(&url, query, limit);
     let resp = client.get(&url).query(&params).send().await?;
     let status = resp.status();
     if !status.is_success() {
@@ -52,6 +53,16 @@ pub async fn search(
     // without special-casing an error variant.
     let results: Vec<Value> = places.into_iter().map(place_to_json).collect();
     Ok(Value::Array(results))
+}
+
+/// Log that a Nominatim `/search` request is starting.
+///
+/// `query` is a tool argument -- content, never an id -- so it stays at
+/// DEBUG and is never attached to a span (a span field would leave the
+/// process with `otel` on regardless of level). Kept as its own function so
+/// a test can drive it directly, without a real network call.
+fn log_search_request(url: &str, query: &str, limit: u32) {
+    tracing::debug!(url, query, limit, "querying nominatim search");
 }
 
 #[cfg(test)]

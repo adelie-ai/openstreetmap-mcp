@@ -116,6 +116,14 @@ pub async fn nearby(
 
     let query = build_query(key, value, radius, latitude, longitude, limit);
 
+    log_nearby_request(
+        &config.overpass_url,
+        latitude,
+        longitude,
+        key,
+        value,
+        radius,
+    );
     // Overpass accepts the raw OverpassQL as the POST body.
     let resp = client.post(&config.overpass_url).body(query).send().await?;
     let status = resp.status();
@@ -170,6 +178,32 @@ pub async fn nearby(
 
     let results: Vec<Value> = features.into_iter().map(|(_, f)| f).collect();
     Ok(Value::Array(results))
+}
+
+/// Log that an Overpass request is starting.
+///
+/// The coordinate, key, and value are tool arguments -- content, never an
+/// id -- so they stay at DEBUG and are never attached to a span. Kept as
+/// its own function so a test can drive it directly, without a real
+/// network call.
+#[allow(clippy::too_many_arguments)]
+fn log_nearby_request(
+    url: &str,
+    latitude: f64,
+    longitude: f64,
+    key: &str,
+    value: Option<&str>,
+    radius: u32,
+) {
+    tracing::debug!(
+        url,
+        latitude,
+        longitude,
+        key,
+        value,
+        radius,
+        "querying overpass"
+    );
 }
 
 #[cfg(test)]

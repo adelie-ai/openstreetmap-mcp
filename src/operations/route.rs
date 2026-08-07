@@ -94,6 +94,7 @@ pub async fn route(
 
     let url = format!("{}/route/v1/{}/{}", config.osrm_base(), profile, coord_path);
 
+    log_route_request(&url, profile, coordinates);
     let resp = client
         .get(&url)
         .query(&[
@@ -179,6 +180,16 @@ pub async fn route(
         "waypoints": waypoints,
         "legs": legs,
     }))
+}
+
+/// Log that an OSRM route request is starting.
+///
+/// The waypoint coordinates and the profile are tool arguments -- content,
+/// never an id -- so they stay at DEBUG and are never attached to a span.
+/// Kept as its own function so a test can drive it directly, without a real
+/// network call.
+fn log_route_request(url: &str, profile: &str, waypoints: &[(f64, f64)]) {
+    tracing::debug!(url, profile, ?waypoints, "querying osrm route");
 }
 
 #[cfg(test)]

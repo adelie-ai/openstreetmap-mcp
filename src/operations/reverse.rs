@@ -34,6 +34,7 @@ pub async fn reverse(
         params.push(("accept-language", lang.to_string()));
     }
 
+    log_reverse_request(&url, latitude, longitude);
     let resp = client.get(&url).query(&params).send().await?;
     let status = resp.status();
     if !status.is_success() {
@@ -57,6 +58,15 @@ pub async fn reverse(
 
     let place: Place = serde_json::from_value(value)?;
     Ok(place_to_json(place))
+}
+
+/// Log that a Nominatim `/reverse` request is starting.
+///
+/// A coordinate is a tool argument -- content, never an id -- so it stays at
+/// DEBUG and is never attached to a span. Kept as its own function so a test
+/// can drive it directly, without a real network call.
+fn log_reverse_request(url: &str, latitude: f64, longitude: f64) {
+    tracing::debug!(url, latitude, longitude, "querying nominatim reverse");
 }
 
 #[cfg(test)]

@@ -68,6 +68,7 @@ pub async fn lookup(
         params.push(("accept-language", lang.to_string()));
     }
 
+    log_lookup_request(&url, osm_ids);
     let resp = client.get(&url).query(&params).send().await?;
     let status = resp.status();
     if !status.is_success() {
@@ -85,6 +86,16 @@ pub async fn lookup(
 
     let results: Vec<Value> = places.into_iter().map(place_to_json).collect();
     Ok(Value::Array(results))
+}
+
+/// Log that a Nominatim `/lookup` request is starting.
+///
+/// `osm_ids` is a tool argument -- content, never an id in the D10 sense of
+/// something safe to log at INFO -- so it stays at DEBUG and is never
+/// attached to a span. Kept as its own function so a test can drive it
+/// directly, without a real network call.
+fn log_lookup_request(url: &str, osm_ids: &str) {
+    tracing::debug!(url, osm_ids, "querying nominatim lookup");
 }
 
 #[cfg(test)]

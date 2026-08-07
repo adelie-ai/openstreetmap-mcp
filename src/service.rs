@@ -1,6 +1,7 @@
 // McpService implementation: wires the OSM operations into the mcp-core
 // dispatch loop.
 
+use mcp_core::telemetry::metrics::{self, Label};
 use mcp_core::{CallError, McpService, ToolDef, ToolReply, async_trait};
 use serde_json::{Value, json};
 
@@ -211,13 +212,18 @@ impl McpService for OsmService {
 }
 
 impl OsmService {
+    // `args` carries the query, coordinate, tag, or id and is skipped: a tool
+    // argument is content, so it must never become a span field (D10). The
+    // span still gives this handler's own work its own timing, nested under
+    // mcp-core's `mcp.tools.call` span.
+    #[tracing::instrument(skip(self, args))]
     async fn call_search(&self, args: &Value) -> Result<ToolReply, CallError> {
         let query = require_str(args, "query")?;
         let limit = get_u64(args, "limit").unwrap_or(10) as u32;
         let language = get_str(args, "language");
         let countrycodes = get_str(args, "countrycodes");
 
-        let result = search::search(
+        let outcome = search::search(
             &self.client,
             &self.config,
             query,
@@ -225,12 +231,14 @@ impl OsmService {
             language,
             countrycodes,
         )
-        .await
-        .map_err(osm_to_call_error)?;
+        .await;
+        record_upstream_failure("osm_search", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn call_reverse(&self, args: &Value) -> Result<ToolReply, CallError> {
         let latitude = require_f64(args, "latitude")?;
         let longitude = require_f64(args, "longitude")?;
@@ -238,7 +246,7 @@ impl OsmService {
         let zoom = get_u64(args, "zoom").map(|z| z as u32);
         let language = get_str(args, "language");
 
-        let result = reverse::reverse(
+        let outcome = reverse::reverse(
             &self.client,
             &self.config,
             latitude,
@@ -246,23 +254,26 @@ impl OsmService {
             zoom,
             language,
         )
-        .await
-        .map_err(osm_to_call_error)?;
+        .await;
+        record_upstream_failure("osm_reverse", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn call_lookup(&self, args: &Value) -> Result<ToolReply, CallError> {
         let osm_ids = require_str(args, "osm_ids")?;
         let language = get_str(args, "language");
 
-        let result = lookup::lookup(&self.client, &self.config, osm_ids, language)
-            .await
-            .map_err(osm_to_call_error)?;
+        let outcome = lookup::lookup(&self.client, &self.config, osm_ids, language).await;
+        record_upstream_failure("osm_lookup", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn call_nearby(&self, args: &Value) -> Result<ToolReply, CallError> {
         let latitude = require_f64(args, "latitude")?;
         let longitude = require_f64(args, "longitude")?;
@@ -272,7 +283,7 @@ impl OsmService {
         let radius = get_u64(args, "radius").unwrap_or(1000) as u32;
         let limit = get_u64(args, "limit").unwrap_or(25) as u32;
 
-        let result = nearby::nearby(
+        let outcome = nearby::nearby(
             &self.client,
             &self.config,
             latitude,
@@ -282,12 +293,14 @@ impl OsmService {
             value,
             limit,
         )
-        .await
-        .map_err(osm_to_call_error)?;
+        .await;
+        record_upstream_failure("osm_nearby", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn call_route(&self, args: &Value) -> Result<ToolReply, CallError> {
         let coordinates = parse_coordinates(args)?;
         for &(lat, lon) in &coordinates {
@@ -296,9 +309,9 @@ impl OsmService {
         let profile = get_str(args, "profile").unwrap_or("driving");
         let steps = args.get("steps").and_then(Value::as_bool).unwrap_or(false);
 
-        let result = route::route(&self.client, &self.config, &coordinates, profile, steps)
-            .await
-            .map_err(osm_to_call_error)?;
+        let outcome = route::route(&self.client, &self.config, &coordinates, profile, steps).await;
+        record_upstream_failure("osm_route", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
@@ -317,6 +330,48 @@ fn osm_to_call_error(e: OsmMcpError) -> CallError {
             CallError::invalid_params(e.to_string())
         }
         _ => CallError::tool(e.to_string()),
+    }
+}
+
+/// Classify an `OsmMcpError` into the bounded reason [`record_upstream_failure`]
+/// counts, or `None` for a decline this crate's own caller or the upstream
+/// service's business logic produced -- rule 8.2 keeps that out of a failure
+/// counter.
+///
+/// Exhaustive over [`OsmMcpError`] (and its nested [`OsmError`] /
+/// [`McpError`]), so a new variant forces this classification to be
+/// revisited rather than silently landing as "not counted". A
+/// `reqwest::Error` splits on `.is_timeout()`, since a stalled upstream and
+/// a refused connection point an operator at different causes.
+fn upstream_failure_reason(err: &OsmMcpError) -> Option<&'static str> {
+    match err {
+        OsmMcpError::Osm(OsmError::ApiError(_)) => Some("api_error"),
+        OsmMcpError::Http(e) if e.is_timeout() => Some("timeout"),
+        OsmMcpError::Http(_) => Some("http_error"),
+        OsmMcpError::Json(_) => Some("bad_response"),
+        OsmMcpError::Io(_) => Some("io_error"),
+        OsmMcpError::Osm(OsmError::NotFound(_))
+        | OsmMcpError::Osm(OsmError::InvalidParameters(_))
+        | OsmMcpError::Mcp(McpError::InvalidToolParameters(_)) => None,
+    }
+}
+
+/// Count an upstream failure against `osm.upstream_failures`.
+///
+/// `tool` is always one of the five `&'static str` literals the call sites
+/// above pass, so the label is bounded there rather than by anything a
+/// caller supplies; `reason` is bounded the same way, by
+/// [`upstream_failure_reason`]'s fixed set of return values. Neither label
+/// is ever built from a query, a coordinate, or any other caller-controlled
+/// string.
+fn record_upstream_failure<T>(tool: &'static str, outcome: &Result<T, OsmMcpError>) {
+    if let Err(err) = outcome
+        && let Some(reason) = upstream_failure_reason(err)
+    {
+        metrics::increment(
+            "osm.upstream_failures",
+            &[Label::new("tool", tool), Label::new("reason", reason)],
+        );
     }
 }
 
