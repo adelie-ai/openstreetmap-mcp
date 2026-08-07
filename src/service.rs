@@ -576,4 +576,138 @@ mod tests {
             );
         }
     }
+
+    // ── Telemetry: the upstream-failure metric (mcp-core#40) ───────────────
+
+    /// Every genuine upstream fault must be classified with a bounded
+    /// reason; every decline (a business "not found", or a caller/operator
+    /// rejection) must classify to `None` so it never inflates a failure
+    /// counter (rule 8.2). Exhaustive over `OsmMcpError` (and its nested
+    /// `OsmError` / `McpError`), so a new variant forces this classification
+    /// to be revisited rather than silently landing as "not counted".
+    #[test]
+    fn upstream_failure_reason_classifies_every_osm_mcp_error_variant() {
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Osm(OsmError::ApiError("HTTP 500".into()))),
+            Some("api_error"),
+            "a non-2xx upstream response is a fault, not a decline"
+        );
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Json(
+                serde_json::from_str::<Value>("not json").unwrap_err()
+            )),
+            Some("bad_response"),
+            "an upstream body that fails to deserialize is a fault"
+        );
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Io(std::io::Error::other("body read failed"))),
+            Some("io_error"),
+            "a body-read failure is a fault"
+        );
+
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Osm(OsmError::NotFound("nothing here".into()))),
+            None,
+            "no result found is a normal business outcome, not a fault"
+        );
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Osm(OsmError::InvalidParameters(
+                "bad tag".into()
+            ))),
+            None,
+            "a rejected caller parameter is a decline, not an upstream fault"
+        );
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Mcp(McpError::InvalidToolParameters(
+                "missing query".into()
+            ))),
+            None,
+            "a rejected tool parameter is a decline, not an upstream fault"
+        );
+    }
+
+    /// `reqwest::Error` carries no public constructor, so this drives the
+    /// timeout/other split through a real (local, fast) network failure:
+    /// connecting to a closed port refuses immediately rather than timing
+    /// out, so it must classify as `http_error`, not `timeout`.
+    #[test]
+    fn upstream_failure_reason_classifies_a_connection_refusal_as_http_error() {
+        let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
+        let err = rt.block_on(async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("port 1 refuses the connection")
+        });
+        assert!(!err.is_timeout(), "a connection refusal is not a timeout");
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Http(err)),
+            Some("http_error"),
+            "a non-timeout transport failure is a fault, classified as http_error"
+        );
+    }
+
+    // The metrics registry [`mcp_core::telemetry::metrics`] records into is
+    // process-global, and `cargo test` runs a file's tests concurrently by
+    // default. This guards every test in this module that touches the
+    // registry so they run one at a time relative to each other; it holds no
+    // data of its own.
+    static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_metrics() -> std::sync::MutexGuard<'static, ()> {
+        METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn record_upstream_failure_increments_only_for_counted_reasons() {
+        let _guard = lock_metrics();
+        use mcp_core::telemetry::metrics::{self, Label};
+
+        let labels = [
+            Label::new("tool", "osm_search"),
+            Label::new("reason", "api_error"),
+        ];
+        let before = counter_total("osm.upstream_failures", &labels);
+
+        let ok: std::result::Result<Value, OsmMcpError> = Ok(json!([]));
+        record_upstream_failure("osm_search", &ok);
+        let decline: std::result::Result<Value, OsmMcpError> =
+            Err(OsmMcpError::Osm(OsmError::NotFound("x".into())));
+        record_upstream_failure("osm_search", &decline);
+        assert_eq!(
+            counter_total("osm.upstream_failures", &labels),
+            before,
+            "a successful call or a decline must not move the counter"
+        );
+
+        let fault: std::result::Result<Value, OsmMcpError> =
+            Err(OsmMcpError::Osm(OsmError::ApiError("HTTP 500".into())));
+        record_upstream_failure("osm_search", &fault);
+        assert_eq!(
+            counter_total("osm.upstream_failures", &labels),
+            before + 1,
+            "an upstream fault must increment the counter, labelled by tool and reason"
+        );
+
+        fn counter_total(name: &str, labels: &[Label]) -> u64 {
+            metrics::global()
+                .snapshot()
+                .counters
+                .iter()
+                .find(|counter| counter.name == name && same_labels(&counter.labels, labels))
+                .map_or(0, |counter| counter.total)
+        }
+
+        fn same_labels(recorded: &[Label], wanted: &[Label]) -> bool {
+            recorded.len() == wanted.len()
+                && wanted.iter().all(|want| {
+                    recorded
+                        .iter()
+                        .any(|have| have.key() == want.key() && have.value() == want.value())
+                })
+        }
+    }
 }

@@ -58,3 +58,46 @@ pub async fn reverse(
     let place: Place = serde_json::from_value(value)?;
     Ok(place_to_json(place))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::operations::test_capture::capture_events;
+
+    /// mcp-core#40: a coordinate is a tool argument -- content, never an id
+    /// -- so the per-request log must stay at DEBUG, carrying the exact
+    /// coordinate.
+    #[test]
+    fn log_reverse_request_puts_the_coordinate_at_debug_only() {
+        const SENTINEL_LATITUDE: f64 = 12.34908675;
+        const SENTINEL_LONGITUDE: f64 = -56.78091234;
+        let events = capture_events(|| {
+            super::log_reverse_request(
+                "https://example.com/reverse",
+                SENTINEL_LATITUDE,
+                SENTINEL_LONGITUDE,
+            )
+        });
+
+        assert_eq!(
+            events.len(),
+            1,
+            "querying nominatim reverse must log exactly one event: {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(
+            event.level,
+            tracing::Level::DEBUG,
+            "the outbound reverse request must log at DEBUG, so it stays off the INFO band"
+        );
+        assert_eq!(
+            event.fields.get("latitude").map(String::as_str),
+            Some(SENTINEL_LATITUDE.to_string()).as_deref(),
+            "the event must carry the coordinate that was reverse-geocoded: {event:?}"
+        );
+        assert_eq!(
+            event.fields.get("longitude").map(String::as_str),
+            Some(SENTINEL_LONGITUDE.to_string()).as_deref(),
+            "the event must carry the coordinate that was reverse-geocoded: {event:?}"
+        );
+    }
+}

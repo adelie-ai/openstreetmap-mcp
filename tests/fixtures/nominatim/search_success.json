@@ -1,0 +1,25 @@
+[
+  {
+    "place_id": 100000001,
+    "licence": "Data (c) OpenStreetMap contributors, ODbL 1.0. https://osm.org/copyright",
+    "osm_type": "relation",
+    "osm_id": 900000001,
+    "lat": "10.0000000",
+    "lon": "20.0000000",
+    "category": "boundary",
+    "type": "administrative",
+    "place_rank": 16,
+    "importance": 0.5,
+    "addresstype": "city",
+    "name": "Fictional City",
+    "display_name": "Fictional City, Example County, Example State, Example Country",
+    "address": {
+      "city": "Fictional City",
+      "county": "Example County",
+      "state": "Example State",
+      "country": "Example Country",
+      "country_code": "xx"
+    },
+    "boundingbox": ["9.9000000", "10.1000000", "19.9000000", "20.1000000"]
+  }
+]

@@ -175,6 +175,61 @@ pub async fn nearby(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::test_capture::capture_events;
+
+    /// mcp-core#40: the coordinate, key, and value are tool arguments, so the
+    /// per-request log must stay at DEBUG.
+    #[test]
+    fn log_nearby_request_puts_the_coordinate_and_tag_at_debug_only() {
+        const SENTINEL_LATITUDE: f64 = 12.34908675;
+        const SENTINEL_LONGITUDE: f64 = -56.78091234;
+        const SENTINEL_KEY: &str = "MARKER-osm-nearby-key-9f3d1c2a";
+        const SENTINEL_VALUE: &str = "MARKER-osm-nearby-value-9f3d1c2a";
+        let events = capture_events(|| {
+            super::log_nearby_request(
+                "https://example.com/interpreter",
+                SENTINEL_LATITUDE,
+                SENTINEL_LONGITUDE,
+                SENTINEL_KEY,
+                Some(SENTINEL_VALUE),
+                500,
+            )
+        });
+
+        assert_eq!(
+            events.len(),
+            1,
+            "querying overpass must log exactly one event: {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(
+            event.level,
+            tracing::Level::DEBUG,
+            "the outbound overpass request must log at DEBUG, so it stays off the INFO band"
+        );
+        assert_eq!(
+            event.fields.get("latitude").map(String::as_str),
+            Some(SENTINEL_LATITUDE.to_string()).as_deref(),
+            "the event must carry the search coordinate: {event:?}"
+        );
+        assert_eq!(
+            event.fields.get("longitude").map(String::as_str),
+            Some(SENTINEL_LONGITUDE.to_string()).as_deref(),
+            "the event must carry the search coordinate: {event:?}"
+        );
+        assert_eq!(
+            event.fields.get("key").map(String::as_str),
+            Some(SENTINEL_KEY),
+            "the event must carry the tag key: {event:?}"
+        );
+        assert!(
+            event
+                .fields
+                .get("value")
+                .is_some_and(|v| v.contains(SENTINEL_VALUE)),
+            "the event must carry the tag value: {event:?}"
+        );
+    }
 
     #[test]
     fn query_includes_all_three_element_types_and_value() {

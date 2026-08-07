@@ -90,6 +90,7 @@ pub async fn lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::test_capture::capture_events;
 
     #[test]
     fn accepts_well_formed_ids() {
@@ -103,5 +104,31 @@ mod tests {
         assert!(validate_osm_ids("N").is_err());
         assert!(validate_osm_ids("123").is_err());
         assert!(validate_osm_ids("N123,,W456").is_err());
+    }
+
+    /// mcp-core#40: `osm_ids` is a tool argument, so the per-request log must
+    /// stay at DEBUG.
+    #[test]
+    fn log_lookup_request_puts_the_osm_ids_at_debug_only() {
+        const SENTINEL: &str = "MARKER-osm-lookup-9f3d1c2a";
+        let events =
+            capture_events(|| super::log_lookup_request("https://example.com/lookup", SENTINEL));
+
+        assert_eq!(
+            events.len(),
+            1,
+            "querying nominatim lookup must log exactly one event: {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(
+            event.level,
+            tracing::Level::DEBUG,
+            "the outbound lookup request must log at DEBUG, so it stays off the INFO band"
+        );
+        assert_eq!(
+            event.fields.get("osm_ids").map(String::as_str),
+            Some(SENTINEL),
+            "the event must carry the ids that were looked up: {event:?}"
+        );
     }
 }
