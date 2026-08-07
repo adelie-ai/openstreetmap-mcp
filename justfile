@@ -28,10 +28,16 @@ check-otel: fmt-check
     cargo clippy --all-targets --features otel -- -D warnings
     cargo build --features otel
     cargo test --features otel
+
+# Both required gate configurations, so a change that only compiles or only
+# passes tests in one of them cannot merge silently. This is what
+# `install-hooks` wires into pre-push (mcp-core#40 lesson 11) -- `check`
+# alone verified `otel` by hand once and never again.
+check-all: check check-otel
 premerge:
     git fetch origin
     git rebase origin/main
-    just check
+    just check-all
 install-hooks:
     git config core.hooksPath .githooks
     @echo "pre-push hook active — bypass once with: git push --no-verify"
