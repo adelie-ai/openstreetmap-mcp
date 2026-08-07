@@ -94,6 +94,7 @@ pub async fn route(
 
     let url = format!("{}/route/v1/{}/{}", config.osrm_base(), profile, coord_path);
 
+    log_route_request(&url, profile, coordinates);
     let resp = client
         .get(&url)
         .query(&[
@@ -181,9 +182,62 @@ pub async fn route(
     }))
 }
 
+/// Log that an OSRM route request is starting.
+///
+/// The waypoint coordinates and the profile are tool arguments -- content,
+/// never an id -- so they stay at DEBUG and are never attached to a span.
+/// Kept as its own function so a test can drive it directly, without a real
+/// network call.
+fn log_route_request(url: &str, profile: &str, waypoints: &[(f64, f64)]) {
+    tracing::debug!(url, profile, ?waypoints, "querying osrm route");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::test_capture::capture_events;
+
+    /// mcp-core#40: waypoint coordinates and the profile are tool arguments,
+    /// so the per-request log must stay at DEBUG.
+    #[test]
+    fn log_route_request_puts_the_waypoints_at_debug_only() {
+        const SENTINEL_LATITUDE: f64 = 12.34908675;
+        const SENTINEL_LONGITUDE: f64 = -56.78091234;
+        let waypoints = [(SENTINEL_LATITUDE, SENTINEL_LONGITUDE), (0.0, 0.0)];
+        let events = capture_events(|| {
+            super::log_route_request(
+                "https://example.com/route/v1/driving/...",
+                "driving",
+                &waypoints,
+            )
+        });
+
+        assert_eq!(
+            events.len(),
+            1,
+            "querying osrm route must log exactly one event: {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(
+            event.level,
+            tracing::Level::DEBUG,
+            "the outbound route request must log at DEBUG, so it stays off the INFO band"
+        );
+        assert_eq!(
+            event.fields.get("profile").map(String::as_str),
+            Some("driving"),
+            "the event must carry the travel profile: {event:?}"
+        );
+        let waypoints_field = event
+            .fields
+            .get("waypoints")
+            .expect("the event must carry the waypoints field");
+        assert!(
+            waypoints_field.contains(&SENTINEL_LATITUDE.to_string())
+                && waypoints_field.contains(&SENTINEL_LONGITUDE.to_string()),
+            "the event must carry the coordinates that were routed: {event:?}"
+        );
+    }
 
     #[tokio::test]
     async fn rejects_single_coordinate() {

@@ -56,6 +56,43 @@ you can point at a self-hosted or commercial instance:
 > when using the public endpoint. For production load, run your own instances and
 > point the flags at them.
 
+## Logging
+
+`mcp-core`'s `run` installs the process subscriber; this crate calls nothing
+to get it. Logs go to stderr, never stdout — the stdio transport frames
+JSON-RPC on stdout, and one log line there would corrupt the protocol
+stream. `RUST_LOG` sets the level (default `info`); see `mcp-core`'s own
+README for the full level contract, the request/tool-call spans, and the
+standard `OTEL_*` environment variables.
+
+What this server adds on top of what it inherits:
+
+- A `debug!` line each time it starts an outbound request to Nominatim,
+  Overpass, or OSRM — the one network call each tool makes. The query,
+  coordinate, tag, or id in that request is a tool argument, so it stays at
+  DEBUG and is never attached to a span; `RUST_LOG=debug` is what it takes
+  to see it.
+- `osm.upstream_failures`, a counter labelled `tool` and `reason`
+  (`api_error`, `timeout`, `http_error`, `bad_response`, or `io_error`), for
+  a fault reaching outward to one of the three upstream services. A "not
+  found" result, a rejected coordinate, or any other decline is not counted
+  here (rule 8.2) — only a genuine fault is.
+- `mcp-core` already records a tool-call counter and a latency histogram by
+  tool and outcome (`mcp.tools.call`, `mcp.tools.call.duration`); this server
+  does not duplicate them.
+
+### The `otel` feature
+
+Off by default. A pure passthrough —
+`openstreetmap-mcp -> mcp-core -> adelie-telemetry` — so this crate takes no
+direct dependency on `adelie-telemetry` or on any opentelemetry crate. With
+the feature off, `cargo tree` resolves no opentelemetry crate at all.
+
+```bash
+cargo build --features otel
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 ./target/debug/openstreetmap-mcp serve --mode stdio
+```
+
 ## Architecture
 
 The crate mirrors the structure of its sibling MCP servers in this monorepo
@@ -72,15 +109,21 @@ The crate mirrors the structure of its sibling MCP servers in this monorepo
 ## Testing
 
 ```bash
-cargo test                       # unit + protocol/validation integration tests (no network)
+just check                       # default features: fmt, lint, build, test
+just check-otel                  # the same, built with --features otel
 just test-network                # additionally run the live OSM integration tests
 ```
 
 Network-dependent integration tests are gated behind `RUN_NETWORK_TESTS=1` so the
-default suite is deterministic and offline.
+default suite is deterministic and offline. The `tests/telemetry_*.rs` files are
+the telemetry acceptance suite: that stdout carries only JSON-RPC at
+`RUST_LOG=trace`; that no query, coordinate, tag, or id reaches an INFO line or a
+span field, for every tool the server advertises; that `cargo tree` resolves no
+opentelemetry crate by default; and that `osm.upstream_failures` is recorded
+correctly against a local mock server (`tests/fixtures/nominatim/`), never a live
+OSM service.
 
-For local "CI", `just check` runs `fmt-check`, `lint`, `build`, and `test`;
-`just install-hooks` wires it into a pre-push git hook.
+`just install-hooks` wires `check` into a pre-push git hook.
 
 ## License
 

@@ -38,6 +38,7 @@ pub async fn search(
         params.push(("countrycodes", cc.to_string()));
     }
 
+    log_search_request(&url, query, limit);
     let resp = client.get(&url).query(&params).send().await?;
     let status = resp.status();
     if !status.is_success() {
@@ -54,9 +55,20 @@ pub async fn search(
     Ok(Value::Array(results))
 }
 
+/// Log that a Nominatim `/search` request is starting.
+///
+/// `query` is a tool argument -- content, never an id -- so it stays at
+/// DEBUG and is never attached to a span (a span field would leave the
+/// process with `otel` on regardless of level). Kept as its own function so
+/// a test can drive it directly, without a real network call.
+fn log_search_request(url: &str, query: &str, limit: u32) {
+    tracing::debug!(url, query, limit, "querying nominatim search");
+}
+
 #[cfg(test)]
 mod tests {
     use crate::operations::nominatim::{Place, place_to_json};
+    use crate::operations::test_capture::capture_events;
     use serde_json::Value;
 
     #[test]
@@ -68,5 +80,37 @@ mod tests {
         let results: Vec<Value> = empty.into_iter().map(place_to_json).collect();
         let out = Value::Array(results);
         assert_eq!(out, Value::Array(vec![]));
+    }
+
+    /// mcp-core#40: `query` is a tool argument -- content, never an id -- so
+    /// the per-request log must stay at DEBUG, carrying the exact query, and
+    /// nothing else must log while `search` starts a request.
+    #[test]
+    fn log_search_request_puts_the_query_at_debug_only() {
+        const SENTINEL: &str = "MARKER-osm-search-9f3d1c2a";
+        let events =
+            capture_events(|| super::log_search_request("https://example.com/search", SENTINEL, 7));
+
+        assert_eq!(
+            events.len(),
+            1,
+            "querying nominatim search must log exactly one event: {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(
+            event.level,
+            tracing::Level::DEBUG,
+            "the outbound search request must log at DEBUG, so it stays off the INFO band"
+        );
+        assert_eq!(
+            event.fields.get("query").map(String::as_str),
+            Some(SENTINEL),
+            "the event must carry the query that was searched for: {event:?}"
+        );
+        assert_eq!(
+            event.fields.get("limit").map(String::as_str),
+            Some("7"),
+            "the event must carry the effective limit: {event:?}"
+        );
     }
 }

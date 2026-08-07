@@ -1,6 +1,7 @@
 // McpService implementation: wires the OSM operations into the mcp-core
 // dispatch loop.
 
+use mcp_core::telemetry::metrics::{self, Label};
 use mcp_core::{CallError, McpService, ToolDef, ToolReply, async_trait};
 use serde_json::{Value, json};
 
@@ -211,13 +212,18 @@ impl McpService for OsmService {
 }
 
 impl OsmService {
+    // `args` carries the query, coordinate, tag, or id and is skipped: a tool
+    // argument is content, so it must never become a span field (D10). The
+    // span still gives this handler's own work its own timing, nested under
+    // mcp-core's `mcp.tools.call` span.
+    #[tracing::instrument(skip(self, args))]
     async fn call_search(&self, args: &Value) -> Result<ToolReply, CallError> {
         let query = require_str(args, "query")?;
         let limit = get_u64(args, "limit").unwrap_or(10) as u32;
         let language = get_str(args, "language");
         let countrycodes = get_str(args, "countrycodes");
 
-        let result = search::search(
+        let outcome = search::search(
             &self.client,
             &self.config,
             query,
@@ -225,12 +231,14 @@ impl OsmService {
             language,
             countrycodes,
         )
-        .await
-        .map_err(osm_to_call_error)?;
+        .await;
+        record_upstream_failure("osm_search", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn call_reverse(&self, args: &Value) -> Result<ToolReply, CallError> {
         let latitude = require_f64(args, "latitude")?;
         let longitude = require_f64(args, "longitude")?;
@@ -238,7 +246,7 @@ impl OsmService {
         let zoom = get_u64(args, "zoom").map(|z| z as u32);
         let language = get_str(args, "language");
 
-        let result = reverse::reverse(
+        let outcome = reverse::reverse(
             &self.client,
             &self.config,
             latitude,
@@ -246,23 +254,26 @@ impl OsmService {
             zoom,
             language,
         )
-        .await
-        .map_err(osm_to_call_error)?;
+        .await;
+        record_upstream_failure("osm_reverse", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn call_lookup(&self, args: &Value) -> Result<ToolReply, CallError> {
         let osm_ids = require_str(args, "osm_ids")?;
         let language = get_str(args, "language");
 
-        let result = lookup::lookup(&self.client, &self.config, osm_ids, language)
-            .await
-            .map_err(osm_to_call_error)?;
+        let outcome = lookup::lookup(&self.client, &self.config, osm_ids, language).await;
+        record_upstream_failure("osm_lookup", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn call_nearby(&self, args: &Value) -> Result<ToolReply, CallError> {
         let latitude = require_f64(args, "latitude")?;
         let longitude = require_f64(args, "longitude")?;
@@ -272,7 +283,7 @@ impl OsmService {
         let radius = get_u64(args, "radius").unwrap_or(1000) as u32;
         let limit = get_u64(args, "limit").unwrap_or(25) as u32;
 
-        let result = nearby::nearby(
+        let outcome = nearby::nearby(
             &self.client,
             &self.config,
             latitude,
@@ -282,12 +293,14 @@ impl OsmService {
             value,
             limit,
         )
-        .await
-        .map_err(osm_to_call_error)?;
+        .await;
+        record_upstream_failure("osm_nearby", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn call_route(&self, args: &Value) -> Result<ToolReply, CallError> {
         let coordinates = parse_coordinates(args)?;
         for &(lat, lon) in &coordinates {
@@ -296,9 +309,9 @@ impl OsmService {
         let profile = get_str(args, "profile").unwrap_or("driving");
         let steps = args.get("steps").and_then(Value::as_bool).unwrap_or(false);
 
-        let result = route::route(&self.client, &self.config, &coordinates, profile, steps)
-            .await
-            .map_err(osm_to_call_error)?;
+        let outcome = route::route(&self.client, &self.config, &coordinates, profile, steps).await;
+        record_upstream_failure("osm_route", &outcome);
+        let result = outcome.map_err(osm_to_call_error)?;
 
         Ok(ToolReply::json(&result)?)
     }
@@ -317,6 +330,48 @@ fn osm_to_call_error(e: OsmMcpError) -> CallError {
             CallError::invalid_params(e.to_string())
         }
         _ => CallError::tool(e.to_string()),
+    }
+}
+
+/// Classify an `OsmMcpError` into the bounded reason [`record_upstream_failure`]
+/// counts, or `None` for a decline this crate's own caller or the upstream
+/// service's business logic produced -- rule 8.2 keeps that out of a failure
+/// counter.
+///
+/// Exhaustive over [`OsmMcpError`] (and its nested [`OsmError`] /
+/// [`McpError`]), so a new variant forces this classification to be
+/// revisited rather than silently landing as "not counted". A
+/// `reqwest::Error` splits on `.is_timeout()`, since a stalled upstream and
+/// a refused connection point an operator at different causes.
+fn upstream_failure_reason(err: &OsmMcpError) -> Option<&'static str> {
+    match err {
+        OsmMcpError::Osm(OsmError::ApiError(_)) => Some("api_error"),
+        OsmMcpError::Http(e) if e.is_timeout() => Some("timeout"),
+        OsmMcpError::Http(_) => Some("http_error"),
+        OsmMcpError::Json(_) => Some("bad_response"),
+        OsmMcpError::Io(_) => Some("io_error"),
+        OsmMcpError::Osm(OsmError::NotFound(_))
+        | OsmMcpError::Osm(OsmError::InvalidParameters(_))
+        | OsmMcpError::Mcp(McpError::InvalidToolParameters(_)) => None,
+    }
+}
+
+/// Count an upstream failure against `osm.upstream_failures`.
+///
+/// `tool` is always one of the five `&'static str` literals the call sites
+/// above pass, so the label is bounded there rather than by anything a
+/// caller supplies; `reason` is bounded the same way, by
+/// [`upstream_failure_reason`]'s fixed set of return values. Neither label
+/// is ever built from a query, a coordinate, or any other caller-controlled
+/// string.
+fn record_upstream_failure<T>(tool: &'static str, outcome: &Result<T, OsmMcpError>) {
+    if let Err(err) = outcome
+        && let Some(reason) = upstream_failure_reason(err)
+    {
+        metrics::increment(
+            "osm.upstream_failures",
+            &[Label::new("tool", tool), Label::new("reason", reason)],
+        );
     }
 }
 
@@ -574,6 +629,140 @@ mod tests {
                 "{tool} description should contain at least one natural search term \
                  {NATURAL_SEARCH_TERMS:?}, got: {desc}"
             );
+        }
+    }
+
+    // ── Telemetry: the upstream-failure metric (mcp-core#40) ───────────────
+
+    /// Every genuine upstream fault must be classified with a bounded
+    /// reason; every decline (a business "not found", or a caller/operator
+    /// rejection) must classify to `None` so it never inflates a failure
+    /// counter (rule 8.2). Exhaustive over `OsmMcpError` (and its nested
+    /// `OsmError` / `McpError`), so a new variant forces this classification
+    /// to be revisited rather than silently landing as "not counted".
+    #[test]
+    fn upstream_failure_reason_classifies_every_osm_mcp_error_variant() {
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Osm(OsmError::ApiError("HTTP 500".into()))),
+            Some("api_error"),
+            "a non-2xx upstream response is a fault, not a decline"
+        );
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Json(
+                serde_json::from_str::<Value>("not json").unwrap_err()
+            )),
+            Some("bad_response"),
+            "an upstream body that fails to deserialize is a fault"
+        );
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Io(std::io::Error::other("body read failed"))),
+            Some("io_error"),
+            "a body-read failure is a fault"
+        );
+
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Osm(OsmError::NotFound("nothing here".into()))),
+            None,
+            "no result found is a normal business outcome, not a fault"
+        );
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Osm(OsmError::InvalidParameters(
+                "bad tag".into()
+            ))),
+            None,
+            "a rejected caller parameter is a decline, not an upstream fault"
+        );
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Mcp(McpError::InvalidToolParameters(
+                "missing query".into()
+            ))),
+            None,
+            "a rejected tool parameter is a decline, not an upstream fault"
+        );
+    }
+
+    /// `reqwest::Error` carries no public constructor, so this drives the
+    /// timeout/other split through a real (local, fast) network failure:
+    /// connecting to a closed port refuses immediately rather than timing
+    /// out, so it must classify as `http_error`, not `timeout`.
+    #[test]
+    fn upstream_failure_reason_classifies_a_connection_refusal_as_http_error() {
+        let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
+        let err = rt.block_on(async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("port 1 refuses the connection")
+        });
+        assert!(!err.is_timeout(), "a connection refusal is not a timeout");
+        assert_eq!(
+            upstream_failure_reason(&OsmMcpError::Http(err)),
+            Some("http_error"),
+            "a non-timeout transport failure is a fault, classified as http_error"
+        );
+    }
+
+    // The metrics registry [`mcp_core::telemetry::metrics`] records into is
+    // process-global, and `cargo test` runs a file's tests concurrently by
+    // default. This guards every test in this module that touches the
+    // registry so they run one at a time relative to each other; it holds no
+    // data of its own.
+    static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_metrics() -> std::sync::MutexGuard<'static, ()> {
+        METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn record_upstream_failure_increments_only_for_counted_reasons() {
+        let _guard = lock_metrics();
+        use mcp_core::telemetry::metrics::{self, Label};
+
+        let labels = [
+            Label::new("tool", "osm_search"),
+            Label::new("reason", "api_error"),
+        ];
+        let before = counter_total("osm.upstream_failures", &labels);
+
+        let ok: std::result::Result<Value, OsmMcpError> = Ok(json!([]));
+        record_upstream_failure("osm_search", &ok);
+        let decline: std::result::Result<Value, OsmMcpError> =
+            Err(OsmMcpError::Osm(OsmError::NotFound("x".into())));
+        record_upstream_failure("osm_search", &decline);
+        assert_eq!(
+            counter_total("osm.upstream_failures", &labels),
+            before,
+            "a successful call or a decline must not move the counter"
+        );
+
+        let fault: std::result::Result<Value, OsmMcpError> =
+            Err(OsmMcpError::Osm(OsmError::ApiError("HTTP 500".into())));
+        record_upstream_failure("osm_search", &fault);
+        assert_eq!(
+            counter_total("osm.upstream_failures", &labels),
+            before + 1,
+            "an upstream fault must increment the counter, labelled by tool and reason"
+        );
+
+        fn counter_total(name: &str, labels: &[Label]) -> u64 {
+            metrics::global()
+                .snapshot()
+                .counters
+                .iter()
+                .find(|counter| counter.name == name && same_labels(&counter.labels, labels))
+                .map_or(0, |counter| counter.total)
+        }
+
+        fn same_labels(recorded: &[Label], wanted: &[Label]) -> bool {
+            recorded.len() == wanted.len()
+                && wanted.iter().all(|want| {
+                    recorded
+                        .iter()
+                        .any(|have| have.key() == want.key() && have.value() == want.value())
+                })
         }
     }
 }
